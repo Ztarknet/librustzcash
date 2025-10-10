@@ -2143,11 +2143,19 @@ pub fn send_multi_step_proposed_transfer<T: ShieldedPoolTester, DSF>(
             Err(e) if is_reached_gap_limit(&e, account_id, expected_bad_index));
         };
 
+    assert_matches!(
+        known_addrs[usize::try_from(gap_limits.ephemeral()).unwrap()]
+            .1
+            .exposure(),
+        Exposure::Unknown
+    );
+
     let next_reserved = reservation_should_succeed(&mut st, 1);
     assert_eq!(
-        next_reserved[0],
-        known_addrs[usize::try_from(gap_limits.ephemeral()).unwrap()]
+        next_reserved[0].0,
+        known_addrs[usize::try_from(gap_limits.ephemeral()).unwrap()].0
     );
+    assert_matches!(next_reserved[0].1.exposure(), Exposure::Exposed { .. });
 
     // The range of address indices that are safe to reserve now is
     // 0..(gap_limits.ephemeral() * 2 - 1)`, and we have already reserved or used
