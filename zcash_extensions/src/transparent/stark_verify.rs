@@ -13,9 +13,11 @@ use std::ops::{Deref, DerefMut};
 
 // Stwo Cairo imports for STARK verification
 use bzip2::read::BzDecoder;
+use cairo_air::utils::get_verification_output;
 use cairo_air::verifier::verify_cairo;
 use cairo_air::{CairoProof, PreProcessedTraceVariant};
 use stwo::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+use stwo_cairo_serialize::CairoDeserialize;
 
 use zcash_primitives::{
     extensions::transparent::{Extension, ExtensionTxBuilder, FromPayload, ToPayload},
@@ -25,6 +27,9 @@ use zcash_protocol::value::Zatoshis;
 
 /// Types and constants used for Mode 0 (verify STARK proof)
 pub mod verify {
+    use starknet_ff::FieldElement;
+    use stwo_cairo_serialize::{CairoDeserialize, CairoSerialize};
+
     pub const MODE: u32 = 0;
 
     /// Proof encoding format
@@ -38,9 +43,35 @@ pub mod verify {
     }
 
     /// Precondition for STARK verification.
-    /// Currently empty, will later contain verification key and public inputs.
+    /// Contains the state root that must be verified against the proof.
     #[derive(Debug, PartialEq, Eq, Clone)]
-    pub struct Precondition;
+    pub struct Precondition {
+        /// State root (32 bytes)
+        pub root: [u8; 32],
+    }
+
+    /// Bootloader output structure from Cairo proof
+    #[derive(Debug, Clone, CairoSerialize, CairoDeserialize)]
+    pub struct BootloaderOutput {
+        pub n_tasks: usize,
+        pub task_output_size: usize,
+        pub task_program_hash: FieldElement,
+    }
+
+    /// OS output header structure containing state roots and block information
+    #[derive(Debug, Clone, CairoSerialize, CairoDeserialize)]
+    pub struct OsOutputHeader {
+        pub initial_root: FieldElement,
+        pub final_root: FieldElement,
+        pub prev_block_number: FieldElement,
+        pub new_block_number: FieldElement,
+        pub prev_block_hash: FieldElement,
+        pub new_block_hash: FieldElement,
+        pub os_program_hash: FieldElement,
+        pub starknet_os_config_hash: FieldElement,
+        pub use_kzg_da: FieldElement,
+        pub full_output: FieldElement,
+    }
 
     /// Witness containing STARK proof.
     /// Contains the serialized Cairo proof data and metadata for verification.
@@ -74,8 +105,8 @@ pub enum Precondition {
 
 impl Precondition {
     /// Convenience constructor for verify precondition values.
-    pub fn verify() -> Self {
-        Precondition::Verify(verify::Precondition)
+    pub fn verify(root: [u8; 32]) -> Self {
+        Precondition::Verify(verify::Precondition { root })
     }
 }
 
@@ -92,6 +123,16 @@ pub enum Error {
     /// Verification error indicating that the witness being verified did not
     /// satisfy the precondition.
     VerificationFailed,
+    /// Verification error indicating that an unexpected number of TZE outputs was encountered.
+    InvalidOutputQty(usize),
+    /// Verification error indicating that the initial root from input doesn't match proof.
+    InitialRootMismatch,
+    /// Verification error indicating that the final root from output doesn't match proof.
+    FinalRootMismatch,
+    /// Verification error indicating that the output precondition could not be parsed.
+    OutputPreconditionParseFailure,
+    /// Verification error indicating that the proof public output could not be parsed.
+    PublicOutputParseFailure,
 }
 
 impl fmt::Display for Error {
@@ -103,6 +144,11 @@ impl fmt::Display for Error {
             Error::ModeInvalid(m) => write!(f, "Invalid TZE mode for stark_verify: {}", m),
             Error::DecodingProofFailed => write!(f, "Failed to decode/deserialize STARK proof"),
             Error::VerificationFailed => write!(f, "STARK verification failed"),
+            Error::InvalidOutputQty(qty) => write!(f, "Incorrect number of TZE outputs: {}", qty),
+            Error::InitialRootMismatch => write!(f, "Initial root from input doesn't match proof"),
+            Error::FinalRootMismatch => write!(f, "Final root from output doesn't match proof"),
+            Error::OutputPreconditionParseFailure => write!(f, "Failed to parse output precondition"),
+            Error::PublicOutputParseFailure => write!(f, "Failed to parse proof public output"),
         }
     }
 }
@@ -124,9 +170,11 @@ impl FromPayload for Precondition {
     fn from_payload(mode: u32, payload: &[u8]) -> Result<Self, Self::Error> {
         match mode {
             verify::MODE => {
-                // For now, accept empty payload
-                if payload.is_empty() {
-                    Ok(Precondition::verify())
+                // Expect 32 bytes for the root value
+                if payload.len() == 32 {
+                    let mut root = [0u8; 32];
+                    root.copy_from_slice(payload);
+                    Ok(Precondition::verify(root))
                 } else {
                     Err(Error::IllegalPayloadLength(payload.len()))
                 }
@@ -139,7 +187,7 @@ impl FromPayload for Precondition {
 impl ToPayload for Precondition {
     fn to_payload(&self) -> (u32, Vec<u8>) {
         match self {
-            Precondition::Verify(_) => (verify::MODE, vec![]),
+            Precondition::Verify(p) => (verify::MODE, p.root.to_vec()),
         }
     }
 }
@@ -219,8 +267,12 @@ impl ToPayload for Witness {
 /// This trait defines the context information that the stark_verify extension
 /// requires from a consensus node integrating this extension.
 ///
-/// Currently minimal; will be extended as STARK verification is implemented.
-pub trait Context {}
+/// This context type provides accessors to information relevant to a single
+/// transaction being validated by the extension.
+pub trait Context {
+    /// List of all TZE outputs in the transaction being validated by the extension.
+    fn tx_tze_outputs(&self) -> &[zcash_primitives::transaction::components::tze::TzeOut];
+}
 
 /// Marker type for the stark_verify extension.
 ///
@@ -240,11 +292,30 @@ impl<C: Context> Extension<C> for Program {
         &self,
         precondition: &Precondition,
         witness: &Witness,
-        _context: &C,
+        context: &C,
     ) -> Result<(), Error> {
         match (precondition, witness) {
-            (Precondition::Verify(_), Witness::Verify(w)) => {
-                // Parse the Cairo proof based on the encoding format
+            (Precondition::Verify(p_input), Witness::Verify(w)) => {
+                // 1. Get the input_initial_root from the input precondition
+                let input_initial_root = p_input.root;
+
+                // 2. Check that there is exactly one TZE output and get its precondition
+                let outputs = context.tx_tze_outputs();
+                let output_final_root = match outputs {
+                    [tze_out] => {
+                        // Parse the output precondition to get the final root
+                        match Precondition::from_payload(
+                            tze_out.precondition.mode,
+                            &tze_out.precondition.payload,
+                        ) {
+                            Ok(Precondition::Verify(p_output)) => p_output.root,
+                            Err(_) => return Err(Error::OutputPreconditionParseFailure),
+                        }
+                    }
+                    _ => return Err(Error::InvalidOutputQty(outputs.len())),
+                };
+
+                // 3. Parse the Cairo proof based on the encoding format
                 let cairo_proof: CairoProof<Blake2sMerkleHasher> = match w.proof_format {
                     verify::ProofFormat::JsonEnc => {
                         // Parse the Cairo proof from JSON
@@ -276,14 +347,41 @@ impl<C: Context> Extension<C> for Program {
                     }
                 };
 
-                // Determine the preprocessed trace variant based on Pedersen flag
+                // 4. Parse the proof's public output to get the roots from the proof
+                let verification_output = get_verification_output(&cairo_proof.claim.public_data.public_memory);
+                let public_output = &verification_output.output;
+
+                // Deserialize BootloaderOutput (first 3 felts) and OsOutputHeader (next 10 felts)
+                let mut iter = public_output.iter();
+                let _bootloader_output = verify::BootloaderOutput::deserialize(&mut iter);
+                let os_header = verify::OsOutputHeader::deserialize(&mut iter);
+
+                // Convert FieldElements to bytes for comparison
+                let proof_initial_root: [u8; 32] = os_header.initial_root.to_bytes_be()
+                    .try_into()
+                    .map_err(|_| Error::PublicOutputParseFailure)?;
+                let proof_final_root: [u8; 32] = os_header.final_root.to_bytes_be()
+                    .try_into()
+                    .map_err(|_| Error::PublicOutputParseFailure)?;
+
+                // 5. Verify that input_initial_root == os_header.initial_root
+                if input_initial_root != proof_initial_root {
+                    return Err(Error::InitialRootMismatch);
+                }
+
+                // 6. Verify that output_final_root == os_header.final_root
+                if output_final_root != proof_final_root {
+                    return Err(Error::FinalRootMismatch);
+                }
+
+                // 7. Determine the preprocessed trace variant based on Pedersen flag
                 let preprocessed_trace = if w.with_pedersen {
                     PreProcessedTraceVariant::Canonical
                 } else {
                     PreProcessedTraceVariant::CanonicalWithoutPedersen
                 };
 
-                // Verify the STARK proof (matching cairo-prove CLI exactly)
+                // 8. Verify the STARK proof (matching cairo-prove CLI exactly)
                 verify_cairo::<Blake2sMerkleChannel>(
                     cairo_proof,
                     preprocessed_trace,
@@ -336,9 +434,10 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
     pub fn add_stark_verify_output(
         &mut self,
         value: Zatoshis,
+        root: [u8; 32],
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         self.txn_builder
-            .add_tze_output(self.extension_id, value, &Precondition::verify())
+            .add_tze_output(self.extension_id, value, &Precondition::verify(root))
             .map_err(StarkVerifyBuildError::BaseBuilderError)
     }
 
@@ -380,23 +479,88 @@ mod tests {
 
     use super::{Context, Precondition, Program, Witness, verify};
 
+    /// Helper function to extract roots from a Cairo proof for testing
+    fn extract_roots_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: verify::ProofFormat) -> Result<([u8; 32], [u8; 32]), String> {
+        use bzip2::read::BzDecoder;
+        use cairo_air::utils::get_verification_output;
+        use cairo_air::CairoProof;
+        use stwo::core::vcs::blake2_merkle::Blake2sMerkleHasher;
+        use stwo_cairo_serialize::CairoDeserialize;
+        use std::io::Read;
+
+        // Parse the Cairo proof based on the encoding format
+        let cairo_proof: CairoProof<Blake2sMerkleHasher> = match proof_format {
+            verify::ProofFormat::JsonEnc => {
+                let proof_str = std::str::from_utf8(proof_data)
+                    .map_err(|_| "Failed to decode proof as UTF-8")?;
+                serde_json::from_str(proof_str).map_err(|e| format!("Failed to parse JSON: {}", e))?
+            }
+            verify::ProofFormat::BinEnc => {
+                // Check if the data is bzip2-compressed
+                let actual_data = if proof_data.len() >= 2 && proof_data[0] == b'B' && proof_data[1] == b'Z' {
+                    let mut bz_decoder = BzDecoder::new(proof_data);
+                    let mut decompressed = Vec::new();
+                    bz_decoder.read_to_end(&mut decompressed)
+                        .map_err(|e| format!("Failed to decompress: {}", e))?;
+                    decompressed
+                } else {
+                    proof_data.to_vec()
+                };
+                bincode::deserialize(&actual_data)
+                    .map_err(|e| format!("Failed to deserialize bincode: {}", e))?
+            }
+        };
+
+        // Parse the proof's public output
+        let verification_output = get_verification_output(&cairo_proof.claim.public_data.public_memory);
+        let public_output = &verification_output.output;
+
+        let mut iter = public_output.iter();
+        let _bootloader_output = verify::BootloaderOutput::deserialize(&mut iter);
+        let os_header = verify::OsOutputHeader::deserialize(&mut iter);
+
+        let initial_root: [u8; 32] = os_header.initial_root.to_bytes_be()
+            .try_into()
+            .map_err(|_| "Failed to convert initial_root to bytes")?;
+        let final_root: [u8; 32] = os_header.final_root.to_bytes_be()
+            .try_into()
+            .map_err(|_| "Failed to convert final_root to bytes")?;
+
+        Ok((initial_root, final_root))
+    }
+
     #[test]
     fn precondition_verify_round_trip() {
-        let data = vec![];
+        let root = [7u8; 32];
+        let data = root.to_vec();
         let p = Precondition::from_payload(verify::MODE, &data).unwrap();
-        assert_eq!(p, Precondition::Verify(verify::Precondition));
+        assert_eq!(p, Precondition::verify(root));
         assert_eq!(p.to_payload(), (verify::MODE, data));
     }
 
     #[test]
     fn precondition_rejects_invalid_mode() {
-        let p = Precondition::from_payload(99, &[]);
+        let root = [7u8; 32];
+        let p = Precondition::from_payload(99, &root);
         assert!(p.is_err());
     }
 
     #[test]
-    fn precondition_rejects_non_empty_payload() {
+    fn precondition_rejects_invalid_payload_length() {
+        // Empty payload should be rejected
+        let p = Precondition::from_payload(verify::MODE, &[]);
+        assert!(p.is_err());
+
+        // Wrong length payload should be rejected
         let p = Precondition::from_payload(verify::MODE, &[1, 2, 3]);
+        assert!(p.is_err());
+
+        // 31 bytes should be rejected
+        let p = Precondition::from_payload(verify::MODE, &[0u8; 31]);
+        assert!(p.is_err());
+
+        // 33 bytes should be rejected
+        let p = Precondition::from_payload(verify::MODE, &[0u8; 33]);
         assert!(p.is_err());
     }
 
@@ -445,15 +609,302 @@ mod tests {
     }
 
     /// Dummy context for testing
-    struct Ctx;
-    impl Context for Ctx {}
+    struct Ctx<'a> {
+        tx: &'a zcash_primitives::transaction::Transaction,
+    }
+
+    impl<'a> Context for Ctx<'a> {
+        fn tx_tze_outputs(&self) -> &[zcash_primitives::transaction::components::tze::TzeOut] {
+            match self.tx.tze_bundle() {
+                Some(b) => &b.vout,
+                None => &[],
+            }
+        }
+    }
 
     #[test]
     fn stark_verify_program_succeeds() {
-        // Create a simple transaction with STARK verify TZE
+        // Use dummy roots for testing
+        let initial_root = [1u8; 32];
+        let final_root = [2u8; 32];
+
+        // Create a simple transaction with STARK verify TZE input and output
+        let out_a = TzeOut {
+            value: Zatoshis::from_u64(1).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+        };
+
+        let tx_a = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![],
+                vout: vec![out_a],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Create spending transaction with a dummy witness and output (just for structural test)
+        let in_witness = TzeIn {
+            prevout: OutPoint::new(tx_a.txid(), 0),
+            witness: tze::Witness::from(0, &Witness::verify(vec![1, 2, 3], false, verify::ProofFormat::JsonEnc)),
+        };
+
+        let out_b = TzeOut {
+            value: Zatoshis::from_u64(1).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+        };
+
+        let tx_b = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![in_witness],
+                vout: vec![out_b],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Verify the spend - this should fail with dummy data
+        let ctx = Ctx { tx: &tx_b };
+        let result = Program.verify(
+            &tx_a.tze_bundle().unwrap().vout[0].precondition,
+            &tx_b.tze_bundle().unwrap().vin[0].witness,
+            &ctx,
+        );
+        // Dummy proof data should fail verification
+        assert!(result.is_err());
+    }
+
+    /// This test demonstrates the full STARK verification integration using actual transactions.
+    ///
+    /// NOTE: Currently ignored because the all_opcode_components proof is a simple Cairo program
+    /// proof without the Starknet OS header structure (BootloaderOutput + OsOutputHeader).
+    /// The stark_verify extension now requires proofs with OS headers to verify state roots.
+    /// Use verify_proof_sepolia test instead, which uses a real Starknet block proof.
+    #[test]
+    #[ignore]
+    fn verify_proof_all_opcode_components() {
+        // Load the embedded proof from test fixtures
+        //
+        // Generated using this command inside stwo-cairo stwo_cairo_prover crate:
+        // ./target/release/run_and_prove \
+        //   --program ./test_data/test_prove_verify_all_opcode_components/compiled.json \
+        //   --proof_path example_proof.json \
+        //   --verify
+        let proof_str = include_str!("../../tests/fixtures/all_opcode_components_proof.json");
+        let proof_data = proof_str.as_bytes().to_vec();
+
+        // Extract roots from the proof
+        let (initial_root, final_root) = extract_roots_from_proof(
+            &proof_data,
+            true,
+            verify::ProofFormat::JsonEnc
+        ).expect("Failed to extract roots from proof");
+
+        //
+        // Create a transaction with a STARK verification precondition output
+        //
+        let out = TzeOut {
+            value: Zatoshis::from_u64(100000).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+        };
+
+        let tx_a = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![],
+                vout: vec![out],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        //
+        // Create a spending transaction with the STARK proof witness and output with final root
+        //
+        let in_witness = TzeIn {
+            prevout: OutPoint::new(tx_a.txid(), 0),
+            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::JsonEnc)),
+        };
+
+        let out_b = TzeOut {
+            value: Zatoshis::from_u64(100000).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+        };
+
+        let tx_b = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![in_witness],
+                vout: vec![out_b],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        //
+        // Verify the spending transaction using the full verification path
+        //
+        let ctx = Ctx { tx: &tx_b };
+        let result = Program.verify(
+            &tx_a.tze_bundle().unwrap().vout[0].precondition,
+            &tx_b.tze_bundle().unwrap().vin[0].witness,
+            &ctx,
+        );
+
+        // The proof should verify successfully
+        assert!(
+            result.is_ok(),
+            "STARK proof verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// This test demonstrates STARK proof verification from Starknet Sepolia network.
+    #[test]
+    fn verify_proof_sepolia() {
+        // Load the compressed proof from test fixtures
+        //
+        // Generated using this command inside Ztarknet/gpp:
+        // cargo run -- -b 2725346 -n sepolia
+        let proof_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/proof-sepolia-2725346.bz");
+        let proof_data = std::fs::read(proof_file)
+            .expect("Failed to read compressed proof file");
+
+        // Extract roots from the proof
+        let (initial_root, final_root) = extract_roots_from_proof(
+            &proof_data,
+            true,
+            verify::ProofFormat::BinEnc
+        ).expect("Failed to extract roots from proof");
+
+        // Create a transaction with a STARK verification precondition output
+        let out = TzeOut {
+            value: Zatoshis::from_u64(100000).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+        };
+
+        let tx_a = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![],
+                vout: vec![out],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Create a spending transaction with the STARK proof witness (binary encoded) and output with final root
+        let in_witness = TzeIn {
+            prevout: OutPoint::new(tx_a.txid(), 0),
+            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::BinEnc)),
+        };
+
+        let out_b = TzeOut {
+            value: Zatoshis::from_u64(100000).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+        };
+
+        let tx_b = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![in_witness],
+                vout: vec![out_b],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Verify the spending transaction using the full verification path
+        let ctx = Ctx { tx: &tx_b };
+        let result = Program.verify(
+            &tx_a.tze_bundle().unwrap().vout[0].precondition,
+            &tx_b.tze_bundle().unwrap().vin[0].witness,
+            &ctx,
+        );
+        // The proof should verify successfully
+        assert!(
+            result.is_ok(),
+            "STARK proof verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn verify_inner_basic_flow() {
+        // This test demonstrates that the verify_inner function is properly wired up
+        // and can parse/verify proofs. It expects failure with invalid proof data,
+        // which confirms the verification logic is running.
+
+        let initial_root = [1u8; 32];
+        let final_root = [2u8; 32];
+
+        // Create a transaction with TZE output for context
         let out = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify()),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
         };
 
         let tx = TransactionData::from_parts_zfuture(
@@ -476,215 +927,8 @@ mod tests {
         .freeze()
         .unwrap();
 
-        // Create spending transaction with a dummy witness (just for structural test)
-        let in_witness = TzeIn {
-            prevout: OutPoint::new(tx.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(vec![1, 2, 3], false, verify::ProofFormat::JsonEnc)),
-        };
-
-        let tx_spend = TransactionData::from_parts_zfuture(
-            TxVersion::ZFuture,
-            BranchId::ZFuture,
-            0,
-            0u32.into(),
-            #[cfg(feature = "zip-233")]
-            Zatoshis::ZERO,
-            None,
-            None,
-            None,
-            None,
-            Some(Bundle {
-                vin: vec![in_witness],
-                vout: vec![],
-                authorization: Authorized,
-            }),
-        )
-        .freeze()
-        .unwrap();
-
-        // Verify the spend - this should fail with dummy data
-        let ctx = Ctx;
-        let result = Program.verify(
-            &tx.tze_bundle().unwrap().vout[0].precondition,
-            &tx_spend.tze_bundle().unwrap().vin[0].witness,
-            &ctx,
-        );
-        // Dummy proof data should fail verification
-        assert!(result.is_err());
-    }
-
-    /// This test demonstrates the full STARK verification integration using actual transactions.
-    #[test]
-    fn verify_proof_all_opcode_components() {
-        // Load the embedded proof from test fixtures
-        //
-        // Generated using this command inside stwo-cairo stwo_cairo_prover crate:
-        // ./target/release/run_and_prove \
-        //   --program ./test_data/test_prove_verify_all_opcode_components/compiled.json \
-        //   --proof_path example_proof.json \
-        //   --verify
-        let proof_str = include_str!("../../tests/fixtures/all_opcode_components_proof.json");
-        let proof_data = proof_str.as_bytes().to_vec();
-
-        //
-        // Create a transaction with a STARK verification precondition output
-        //
-        let out = TzeOut {
-            value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify()),
-        };
-
-        let tx_a = TransactionData::from_parts_zfuture(
-            TxVersion::ZFuture,
-            BranchId::ZFuture,
-            0,
-            0u32.into(),
-            #[cfg(feature = "zip-233")]
-            Zatoshis::ZERO,
-            None,
-            None,
-            None,
-            None,
-            Some(Bundle {
-                vin: vec![],
-                vout: vec![out],
-                authorization: Authorized,
-            }),
-        )
-        .freeze()
-        .unwrap();
-
-        //
-        // Create a spending transaction with the STARK proof witness
-        //
-        let in_witness = TzeIn {
-            prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::JsonEnc)),
-        };
-
-        let tx_b = TransactionData::from_parts_zfuture(
-            TxVersion::ZFuture,
-            BranchId::ZFuture,
-            0,
-            0u32.into(),
-            #[cfg(feature = "zip-233")]
-            Zatoshis::ZERO,
-            None,
-            None,
-            None,
-            None,
-            Some(Bundle {
-                vin: vec![in_witness],
-                vout: vec![],
-                authorization: Authorized,
-            }),
-        )
-        .freeze()
-        .unwrap();
-
-        //
-        // Verify the spending transaction using the full verification path
-        //
-        let ctx = Ctx;
-        let result = Program.verify(
-            &tx_a.tze_bundle().unwrap().vout[0].precondition,
-            &tx_b.tze_bundle().unwrap().vin[0].witness,
-            &ctx,
-        );
-
-        // The proof should verify successfully
-        assert!(
-            result.is_ok(),
-            "STARK proof verification failed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn verify_proof_sepolia() {
-        // Load the compressed proof from test fixtures
-        //
-        // Generated using this command inside Ztarknet/gpp:
-        // cargo run -- -b 2725346 -n sepolia
-        let proof_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/proof-sepolia-2725346.bz");
-        let proof_data = std::fs::read(proof_file)
-            .expect("Failed to read compressed proof file");
-
-        // Create a transaction with a STARK verification precondition output
-        let out = TzeOut {
-            value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify()),
-        };
-
-        let tx_a = TransactionData::from_parts_zfuture(
-            TxVersion::ZFuture,
-            BranchId::ZFuture,
-            0,
-            0u32.into(),
-            #[cfg(feature = "zip-233")]
-            Zatoshis::ZERO,
-            None,
-            None,
-            None,
-            None,
-            Some(Bundle {
-                vin: vec![],
-                vout: vec![out],
-                authorization: Authorized,
-            }),
-        )
-        .freeze()
-        .unwrap();
-
-        // Create a spending transaction with the STARK proof witness (binary encoded)
-        let in_witness = TzeIn {
-            prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::BinEnc)),
-        };
-        let tx_b = TransactionData::from_parts_zfuture(
-            TxVersion::ZFuture,
-            BranchId::ZFuture,
-            0,
-            0u32.into(),
-            #[cfg(feature = "zip-233")]
-            Zatoshis::ZERO,
-            None,
-            None,
-            None,
-            None,
-            Some(Bundle {
-                vin: vec![in_witness],
-                vout: vec![],
-                authorization: Authorized,
-            }),
-        )
-        .freeze()
-        .unwrap();
-
-        // Verify the spending transaction using the full verification path
-        let ctx = Ctx;
-        let result = Program.verify(
-            &tx_a.tze_bundle().unwrap().vout[0].precondition,
-            &tx_b.tze_bundle().unwrap().vin[0].witness,
-            &ctx,
-        );
-        // The proof should verify successfully
-        assert!(
-            result.is_ok(),
-            "STARK proof verification failed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn verify_inner_basic_flow() {
-        // This test demonstrates that the verify_inner function is properly wired up
-        // and can parse/verify proofs. It expects failure with invalid proof data,
-        // which confirms the verification logic is running.
-
-        let ctx = Ctx;
-        let precondition = Precondition::verify();
+        let ctx = Ctx { tx: &tx };
+        let precondition = Precondition::verify(initial_root);
 
         // Test 1: Invalid JSON should fail at parsing stage
         let invalid_json = b"{invalid json}".to_vec();

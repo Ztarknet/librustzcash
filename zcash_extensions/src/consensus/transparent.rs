@@ -101,7 +101,15 @@ impl<'a> demo::Context for Context<'a> {
 
 /// Implementation of required operations for the stark_verify extension, as satisfied
 /// by the context.
-impl stark_verify::Context for Context<'_> {}
+impl stark_verify::Context for Context<'_> {
+    fn tx_tze_outputs(&self) -> &[TzeOut] {
+        if let Some(bundle) = self.tx.tze_bundle() {
+            &bundle.vout
+        } else {
+            &[]
+        }
+    }
+}
 
 /// Identifier for the set of TZEs associated with the ZFUTURE network upgrade.
 /// This epoch is intended only for use on private test networks.
