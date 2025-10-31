@@ -23,11 +23,11 @@ zcash_primitives = { version = "0.26", features = ["non-standard-fees", "circuit
 zcash_protocol = { version = "0.7" }
 
 # Stwo Cairo dependencies for STARK verification
-cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", branch = "main" }
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "ee33b014", default-features = false, features = ["parallel", "prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "ee33b014", default-features = false, features = ["parallel", "prover"] }
-stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", branch = "main" }
-stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", branch = "main" }
+cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "f57087fe5ce57e6ffe5b9c42e08038f60b3b12f4" }
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "411d8c6", default-features = false, features = ["parallel", "prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "411d8c6", default-features = false, features = ["parallel", "prover"] }
+stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "f57087fe5ce57e6ffe5b9c42e08038f60b3b12f4" }
+stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "f57087fe5ce57e6ffe5b9c42e08038f60b3b12f4" }
 
 # Additional dependencies required by cairo-air
 starknet-curve = "0.6.0"
