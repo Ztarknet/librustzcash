@@ -43,11 +43,13 @@ pub mod verify {
     }
 
     /// Precondition for STARK verification.
-    /// Contains the state root that must be verified against the proof.
+    /// Contains the state root and program hash that must be verified against the proof.
     #[derive(Debug, PartialEq, Eq, Clone)]
     pub struct Precondition {
         /// State root (32 bytes)
         pub root: [u8; 32],
+        /// Program hash (32 bytes)
+        pub program_hash: [u8; 32],
     }
 
     /// Bootloader output structure from Cairo proof
@@ -105,8 +107,8 @@ pub enum Precondition {
 
 impl Precondition {
     /// Convenience constructor for verify precondition values.
-    pub fn verify(root: [u8; 32]) -> Self {
-        Precondition::Verify(verify::Precondition { root })
+    pub fn verify(root: [u8; 32], program_hash: [u8; 32]) -> Self {
+        Precondition::Verify(verify::Precondition { root, program_hash })
     }
 }
 
@@ -133,6 +135,8 @@ pub enum Error {
     OutputPreconditionParseFailure,
     /// Verification error indicating that the proof public output could not be parsed.
     PublicOutputParseFailure,
+    /// Verification error indicating that program hashes don't match across input, output, and proof.
+    ProgramHashMismatch,
 }
 
 impl fmt::Display for Error {
@@ -149,6 +153,7 @@ impl fmt::Display for Error {
             Error::FinalRootMismatch => write!(f, "Final root from output doesn't match proof"),
             Error::OutputPreconditionParseFailure => write!(f, "Failed to parse output precondition"),
             Error::PublicOutputParseFailure => write!(f, "Failed to parse proof public output"),
+            Error::ProgramHashMismatch => write!(f, "Program hash mismatch between input, output, and proof"),
         }
     }
 }
@@ -170,11 +175,13 @@ impl FromPayload for Precondition {
     fn from_payload(mode: u32, payload: &[u8]) -> Result<Self, Self::Error> {
         match mode {
             verify::MODE => {
-                // Expect 32 bytes for the root value
-                if payload.len() == 32 {
+                // Expect 64 bytes: 32 for root + 32 for program_hash
+                if payload.len() == 64 {
                     let mut root = [0u8; 32];
-                    root.copy_from_slice(payload);
-                    Ok(Precondition::verify(root))
+                    let mut program_hash = [0u8; 32];
+                    root.copy_from_slice(&payload[0..32]);
+                    program_hash.copy_from_slice(&payload[32..64]);
+                    Ok(Precondition::verify(root, program_hash))
                 } else {
                     Err(Error::IllegalPayloadLength(payload.len()))
                 }
@@ -187,7 +194,12 @@ impl FromPayload for Precondition {
 impl ToPayload for Precondition {
     fn to_payload(&self) -> (u32, Vec<u8>) {
         match self {
-            Precondition::Verify(p) => (verify::MODE, p.root.to_vec()),
+            Precondition::Verify(p) => {
+                let mut payload = Vec::with_capacity(64);
+                payload.extend_from_slice(&p.root);
+                payload.extend_from_slice(&p.program_hash);
+                (verify::MODE, payload)
+            }
         }
     }
 }
@@ -296,19 +308,20 @@ impl<C: Context> Extension<C> for Program {
     ) -> Result<(), Error> {
         match (precondition, witness) {
             (Precondition::Verify(p_input), Witness::Verify(w)) => {
-                // 1. Get the input_initial_root from the input precondition
+                // 1. Get the input_initial_root and input_program_hash from the input precondition
                 let input_initial_root = p_input.root;
+                let input_program_hash = p_input.program_hash;
 
                 // 2. Check that there is exactly one TZE output and get its precondition
                 let outputs = context.tx_tze_outputs();
-                let output_final_root = match outputs {
+                let (output_final_root, output_program_hash) = match outputs {
                     [tze_out] => {
-                        // Parse the output precondition to get the final root
+                        // Parse the output precondition to get the final root and program hash
                         match Precondition::from_payload(
                             tze_out.precondition.mode,
                             &tze_out.precondition.payload,
                         ) {
-                            Ok(Precondition::Verify(p_output)) => p_output.root,
+                            Ok(Precondition::Verify(p_output)) => (p_output.root, p_output.program_hash),
                             Err(_) => return Err(Error::OutputPreconditionParseFailure),
                         }
                     }
@@ -347,7 +360,7 @@ impl<C: Context> Extension<C> for Program {
                     }
                 };
 
-                // 4. Parse the proof's public output to get the roots from the proof
+                // 4. Parse the proof's public output to get the roots and program hash from the proof
                 let verification_output = get_verification_output(&cairo_proof.claim.public_data.public_memory);
                 let public_output = &verification_output.output;
 
@@ -363,6 +376,9 @@ impl<C: Context> Extension<C> for Program {
                 let proof_final_root: [u8; 32] = os_header.final_root.to_bytes_be()
                     .try_into()
                     .map_err(|_| Error::PublicOutputParseFailure)?;
+                let proof_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be()
+                    .try_into()
+                    .map_err(|_| Error::PublicOutputParseFailure)?;
 
                 // 5. Verify that input_initial_root == os_header.initial_root
                 if input_initial_root != proof_initial_root {
@@ -374,14 +390,19 @@ impl<C: Context> Extension<C> for Program {
                     return Err(Error::FinalRootMismatch);
                 }
 
-                // 7. Determine the preprocessed trace variant based on Pedersen flag
+                // 7. Verify program hash consistency across input, output, and proof
+                if input_program_hash != output_program_hash || input_program_hash != proof_program_hash {
+                    return Err(Error::ProgramHashMismatch);
+                }
+
+                // 8. Determine the preprocessed trace variant based on Pedersen flag
                 let preprocessed_trace = if w.with_pedersen {
                     PreProcessedTraceVariant::Canonical
                 } else {
                     PreProcessedTraceVariant::CanonicalWithoutPedersen
                 };
 
-                // 8. Verify the STARK proof (matching cairo-prove CLI exactly)
+                // 9. Verify the STARK proof (matching cairo-prove CLI exactly)
                 verify_cairo::<Blake2sMerkleChannel>(
                     cairo_proof,
                     preprocessed_trace,
@@ -435,9 +456,10 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         &mut self,
         value: Zatoshis,
         root: [u8; 32],
+        program_hash: [u8; 32],
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         self.txn_builder
-            .add_tze_output(self.extension_id, value, &Precondition::verify(root))
+            .add_tze_output(self.extension_id, value, &Precondition::verify(root, program_hash))
             .map_err(StarkVerifyBuildError::BaseBuilderError)
     }
 
@@ -479,8 +501,8 @@ mod tests {
 
     use super::{Context, Precondition, Program, Witness, verify};
 
-    /// Helper function to extract roots from a Cairo proof for testing
-    fn extract_roots_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: verify::ProofFormat) -> Result<([u8; 32], [u8; 32]), String> {
+    /// Helper function to extract roots and program hash from a Cairo proof for testing
+    fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: verify::ProofFormat) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
         use bzip2::read::BzDecoder;
         use cairo_air::utils::get_verification_output;
         use cairo_air::CairoProof;
@@ -525,23 +547,31 @@ mod tests {
         let final_root: [u8; 32] = os_header.final_root.to_bytes_be()
             .try_into()
             .map_err(|_| "Failed to convert final_root to bytes")?;
+        let program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be()
+            .try_into()
+            .map_err(|_| "Failed to convert os_program_hash to bytes")?;
 
-        Ok((initial_root, final_root))
+        Ok((initial_root, final_root, program_hash))
     }
 
     #[test]
     fn precondition_verify_round_trip() {
         let root = [7u8; 32];
-        let data = root.to_vec();
+        let program_hash = [9u8; 32];
+        let mut data = Vec::new();
+        data.extend_from_slice(&root);
+        data.extend_from_slice(&program_hash);
         let p = Precondition::from_payload(verify::MODE, &data).unwrap();
-        assert_eq!(p, Precondition::verify(root));
+        assert_eq!(p, Precondition::verify(root, program_hash));
         assert_eq!(p.to_payload(), (verify::MODE, data));
     }
 
     #[test]
     fn precondition_rejects_invalid_mode() {
-        let root = [7u8; 32];
-        let p = Precondition::from_payload(99, &root);
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&[7u8; 32]);
+        data[32..].copy_from_slice(&[9u8; 32]);
+        let p = Precondition::from_payload(99, &data);
         assert!(p.is_err());
     }
 
@@ -555,12 +585,16 @@ mod tests {
         let p = Precondition::from_payload(verify::MODE, &[1, 2, 3]);
         assert!(p.is_err());
 
-        // 31 bytes should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[0u8; 31]);
+        // 32 bytes should be rejected (need 64 bytes now)
+        let p = Precondition::from_payload(verify::MODE, &[0u8; 32]);
         assert!(p.is_err());
 
-        // 33 bytes should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[0u8; 33]);
+        // 63 bytes should be rejected
+        let p = Precondition::from_payload(verify::MODE, &[0u8; 63]);
+        assert!(p.is_err());
+
+        // 65 bytes should be rejected
+        let p = Precondition::from_payload(verify::MODE, &[0u8; 65]);
         assert!(p.is_err());
     }
 
@@ -624,14 +658,15 @@ mod tests {
 
     #[test]
     fn stark_verify_program_succeeds() {
-        // Use dummy roots for testing
+        // Use dummy roots and program hash for testing
         let initial_root = [1u8; 32];
         let final_root = [2u8; 32];
+        let program_hash = [3u8; 32];
 
         // Create a simple transaction with STARK verify TZE input and output
         let out_a = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -662,7 +697,7 @@ mod tests {
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -715,19 +750,19 @@ mod tests {
         let proof_str = include_str!("../../tests/fixtures/all_opcode_components_proof.json");
         let proof_data = proof_str.as_bytes().to_vec();
 
-        // Extract roots from the proof
-        let (initial_root, final_root) = extract_roots_from_proof(
+        // Extract roots and program hash from the proof
+        let (initial_root, final_root, program_hash) = extract_data_from_proof(
             &proof_data,
             true,
             verify::ProofFormat::JsonEnc
-        ).expect("Failed to extract roots from proof");
+        ).expect("Failed to extract data from proof");
 
         //
         // Create a transaction with a STARK verification precondition output
         //
         let out = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -760,7 +795,7 @@ mod tests {
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -813,17 +848,17 @@ mod tests {
         let proof_data = std::fs::read(proof_file)
             .expect("Failed to read compressed proof file");
 
-        // Extract roots from the proof
-        let (initial_root, final_root) = extract_roots_from_proof(
+        // Extract roots and program hash from the proof
+        let (initial_root, final_root, program_hash) = extract_data_from_proof(
             &proof_data,
             true,
             verify::ProofFormat::BinEnc
-        ).expect("Failed to extract roots from proof");
+        ).expect("Failed to extract data from proof");
 
         // Create a transaction with a STARK verification precondition output
         let out = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -854,7 +889,7 @@ mod tests {
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -900,11 +935,12 @@ mod tests {
 
         let initial_root = [1u8; 32];
         let final_root = [2u8; 32];
+        let program_hash = [3u8; 32];
 
         // Create a transaction with TZE output for context
         let out = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root)),
+            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
         };
 
         let tx = TransactionData::from_parts_zfuture(
@@ -928,7 +964,7 @@ mod tests {
         .unwrap();
 
         let ctx = Ctx { tx: &tx };
-        let precondition = Precondition::verify(initial_root);
+        let precondition = Precondition::verify(initial_root, program_hash);
 
         // Test 1: Invalid JSON should fail at parsing stage
         let invalid_json = b"{invalid json}".to_vec();
