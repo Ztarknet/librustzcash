@@ -585,7 +585,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn verify_proof_sepolia() {
         // Load the embedded proof from test fixtures
         //
