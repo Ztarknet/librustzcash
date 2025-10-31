@@ -22,7 +22,7 @@ use zcash_primitives::{
 use zcash_protocol::value::Zatoshis;
 
 /// Types and constants used for Mode 0 (verify STARK proof)
-mod verify {
+pub mod verify {
     pub const MODE: u32 = 0;
 
     /// Proof encoding format
