@@ -25,12 +25,32 @@ use zcash_primitives::{
 };
 use zcash_protocol::value::Zatoshis;
 
-/// Types and constants used for Mode 0 (verify STARK proof)
-pub mod verify {
+/// Types and constants used for Mode 0 (initialize program/channel)
+pub mod initialize {
+    pub const MODE: u32 = 0;
+
+    /// Precondition for channel initialization.
+    /// Contains the initial state root and program hash for a new channel.
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub struct Precondition {
+        /// State root (32 bytes)
+        pub root: [u8; 32],
+        /// Program hash (32 bytes)
+        pub program_hash: [u8; 32],
+    }
+
+    /// Witness for channel initialization.
+    /// Empty witness as initialization doesn't require proof verification.
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub struct Witness;
+}
+
+/// Types and constants used for Mode 1 (verify STARK proof)
+pub mod stark_verify {
     use starknet_ff::FieldElement;
     use stwo_cairo_serialize::{CairoDeserialize, CairoSerialize};
 
-    pub const MODE: u32 = 0;
+    pub const MODE: u32 = 1;
 
     /// Proof encoding format
     /// TEMPORARY: This field will be removed once we settle on a single encoding format
@@ -102,13 +122,19 @@ pub mod verify {
 /// The precondition type for the stark_verify extension.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Precondition {
-    Verify(verify::Precondition),
+    Initialize(initialize::Precondition),
+    StarkVerify(stark_verify::Precondition),
 }
 
 impl Precondition {
-    /// Convenience constructor for verify precondition values.
-    pub fn verify(root: [u8; 32], program_hash: [u8; 32]) -> Self {
-        Precondition::Verify(verify::Precondition { root, program_hash })
+    /// Convenience constructor for initialize precondition values.
+    pub fn initialize(root: [u8; 32], program_hash: [u8; 32]) -> Self {
+        Precondition::Initialize(initialize::Precondition { root, program_hash })
+    }
+
+    /// Convenience constructor for stark_verify precondition values.
+    pub fn stark_verify(root: [u8; 32], program_hash: [u8; 32]) -> Self {
+        Precondition::StarkVerify(stark_verify::Precondition { root, program_hash })
     }
 }
 
@@ -163,7 +189,8 @@ impl TryFrom<(u32, Precondition)> for Precondition {
 
     fn try_from(from: (u32, Self)) -> Result<Self, Self::Error> {
         match from {
-            (verify::MODE, Precondition::Verify(p)) => Ok(Precondition::Verify(p)),
+            (initialize::MODE, Precondition::Initialize(p)) => Ok(Precondition::Initialize(p)),
+            (stark_verify::MODE, Precondition::StarkVerify(p)) => Ok(Precondition::StarkVerify(p)),
             _ => Err(Error::ModeInvalid(from.0)),
         }
     }
@@ -174,14 +201,26 @@ impl FromPayload for Precondition {
 
     fn from_payload(mode: u32, payload: &[u8]) -> Result<Self, Self::Error> {
         match mode {
-            verify::MODE => {
+            initialize::MODE => {
                 // Expect 64 bytes: 32 for root + 32 for program_hash
                 if payload.len() == 64 {
                     let mut root = [0u8; 32];
                     let mut program_hash = [0u8; 32];
                     root.copy_from_slice(&payload[0..32]);
                     program_hash.copy_from_slice(&payload[32..64]);
-                    Ok(Precondition::verify(root, program_hash))
+                    Ok(Precondition::initialize(root, program_hash))
+                } else {
+                    Err(Error::IllegalPayloadLength(payload.len()))
+                }
+            }
+            stark_verify::MODE => {
+                // Expect 64 bytes: 32 for root + 32 for program_hash
+                if payload.len() == 64 {
+                    let mut root = [0u8; 32];
+                    let mut program_hash = [0u8; 32];
+                    root.copy_from_slice(&payload[0..32]);
+                    program_hash.copy_from_slice(&payload[32..64]);
+                    Ok(Precondition::stark_verify(root, program_hash))
                 } else {
                     Err(Error::IllegalPayloadLength(payload.len()))
                 }
@@ -194,11 +233,17 @@ impl FromPayload for Precondition {
 impl ToPayload for Precondition {
     fn to_payload(&self) -> (u32, Vec<u8>) {
         match self {
-            Precondition::Verify(p) => {
+            Precondition::Initialize(p) => {
                 let mut payload = Vec::with_capacity(64);
                 payload.extend_from_slice(&p.root);
                 payload.extend_from_slice(&p.program_hash);
-                (verify::MODE, payload)
+                (initialize::MODE, payload)
+            }
+            Precondition::StarkVerify(p) => {
+                let mut payload = Vec::with_capacity(64);
+                payload.extend_from_slice(&p.root);
+                payload.extend_from_slice(&p.program_hash);
+                (stark_verify::MODE, payload)
             }
         }
     }
@@ -207,13 +252,19 @@ impl ToPayload for Precondition {
 /// The witness type for the stark_verify extension.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Witness {
-    Verify(verify::Witness),
+    Initialize(initialize::Witness),
+    StarkVerify(stark_verify::Witness),
 }
 
 impl Witness {
-    /// Convenience constructor for verify witness values.
-    pub fn verify(proof_data: Vec<u8>, with_pedersen: bool, proof_format: verify::ProofFormat) -> Self {
-        Witness::Verify(verify::Witness {
+    /// Convenience constructor for initialize witness values.
+    pub fn initialize() -> Self {
+        Witness::Initialize(initialize::Witness)
+    }
+
+    /// Convenience constructor for stark_verify witness values.
+    pub fn stark_verify(proof_data: Vec<u8>, with_pedersen: bool, proof_format: stark_verify::ProofFormat) -> Self {
+        Witness::StarkVerify(stark_verify::Witness {
             proof_data,
             with_pedersen,
             proof_format,
@@ -226,7 +277,8 @@ impl TryFrom<(u32, Witness)> for Witness {
 
     fn try_from(from: (u32, Self)) -> Result<Self, Self::Error> {
         match from {
-            (verify::MODE, Witness::Verify(w)) => Ok(Witness::Verify(w)),
+            (initialize::MODE, Witness::Initialize(w)) => Ok(Witness::Initialize(w)),
+            (stark_verify::MODE, Witness::StarkVerify(w)) => Ok(Witness::StarkVerify(w)),
             _ => Err(Error::ModeInvalid(from.0)),
         }
     }
@@ -237,7 +289,15 @@ impl FromPayload for Witness {
 
     fn from_payload(mode: u32, payload: &[u8]) -> Result<Self, Self::Error> {
         match mode {
-            verify::MODE => {
+            initialize::MODE => {
+                // Initialize mode has no witness payload
+                if payload.is_empty() {
+                    Ok(Witness::initialize())
+                } else {
+                    Err(Error::IllegalPayloadLength(payload.len()))
+                }
+            }
+            stark_verify::MODE => {
                 // Payload format: [with_pedersen (1 byte)] + [proof_format (1 byte)] + [proof_data]
                 if payload.len() < 2 {
                     return Err(Error::IllegalPayloadLength(payload.len()));
@@ -245,13 +305,13 @@ impl FromPayload for Witness {
 
                 let with_pedersen = payload[0] != 0;
                 let proof_format = match payload[1] {
-                    0 => verify::ProofFormat::JsonEnc,
-                    1 => verify::ProofFormat::BinEnc,
+                    0 => stark_verify::ProofFormat::JsonEnc,
+                    1 => stark_verify::ProofFormat::BinEnc,
                     _ => return Err(Error::IllegalPayloadLength(payload.len())),
                 };
                 let proof_data = payload[2..].to_vec();
 
-                Ok(Witness::verify(proof_data, with_pedersen, proof_format))
+                Ok(Witness::stark_verify(proof_data, with_pedersen, proof_format))
             }
             _ => Err(Error::ModeInvalid(mode)),
         }
@@ -261,16 +321,20 @@ impl FromPayload for Witness {
 impl ToPayload for Witness {
     fn to_payload(&self) -> (u32, Vec<u8>) {
         match self {
-            Witness::Verify(w) => {
+            Witness::Initialize(_) => {
+                // Initialize mode has no witness payload
+                (initialize::MODE, vec![])
+            }
+            Witness::StarkVerify(w) => {
                 let mut payload = vec![
                     if w.with_pedersen { 1 } else { 0 },
                     match w.proof_format {
-                        verify::ProofFormat::JsonEnc => 0,
-                        verify::ProofFormat::BinEnc => 1,
+                        stark_verify::ProofFormat::JsonEnc => 0,
+                        stark_verify::ProofFormat::BinEnc => 1,
                     },
                 ];
                 payload.extend_from_slice(&w.proof_data);
-                (verify::MODE, payload)
+                (stark_verify::MODE, payload)
             }
         }
     }
@@ -299,7 +363,8 @@ impl<C: Context> Extension<C> for Program {
 
     /// Runs the program against the given precondition, witness, and context.
     ///
-    /// Verifies a STARK proof embedded in the witness against the precondition.
+    /// For Initialize mode: Simply validates that the output precondition is specified correctly.
+    /// For StarkVerify mode: Verifies a STARK proof embedded in the witness against the precondition.
     fn verify_inner(
         &self,
         precondition: &Precondition,
@@ -307,7 +372,30 @@ impl<C: Context> Extension<C> for Program {
         context: &C,
     ) -> Result<(), Error> {
         match (precondition, witness) {
-            (Precondition::Verify(p_input), Witness::Verify(w)) => {
+            (Precondition::Initialize(_p_input), Witness::Initialize(_)) => {
+                // Initialize mode: Validate that there is exactly one TZE output with a precondition
+                let outputs = context.tx_tze_outputs();
+                match outputs {
+                    [tze_out] => {
+                        // Parse the output precondition to verify it's valid
+                        // The output can be either Initialize or StarkVerify mode
+                        match Precondition::from_payload(
+                            tze_out.precondition.mode,
+                            &tze_out.precondition.payload,
+                        ) {
+                            Ok(Precondition::Initialize(_)) | Ok(Precondition::StarkVerify(_)) => {
+                                // Valid output precondition
+                                // For Initialize mode, we don't verify any proof, just ensure the structure is valid
+                                // The input precondition specifies the initial state that can later be verified
+                                Ok(())
+                            }
+                            Err(_) => Err(Error::OutputPreconditionParseFailure),
+                        }
+                    }
+                    _ => Err(Error::InvalidOutputQty(outputs.len())),
+                }
+            }
+            (Precondition::StarkVerify(p_input), Witness::StarkVerify(w)) => {
                 // 1. Get the input_initial_root and input_program_hash from the input precondition
                 let input_initial_root = p_input.root;
                 let input_program_hash = p_input.program_hash;
@@ -321,7 +409,8 @@ impl<C: Context> Extension<C> for Program {
                             tze_out.precondition.mode,
                             &tze_out.precondition.payload,
                         ) {
-                            Ok(Precondition::Verify(p_output)) => (p_output.root, p_output.program_hash),
+                            Ok(Precondition::StarkVerify(p_output)) => (p_output.root, p_output.program_hash),
+                            Ok(Precondition::Initialize(_)) => return Err(Error::OutputPreconditionParseFailure),
                             Err(_) => return Err(Error::OutputPreconditionParseFailure),
                         }
                     }
@@ -330,14 +419,14 @@ impl<C: Context> Extension<C> for Program {
 
                 // 3. Parse the Cairo proof based on the encoding format
                 let cairo_proof: CairoProof<Blake2sMerkleHasher> = match w.proof_format {
-                    verify::ProofFormat::JsonEnc => {
+                    stark_verify::ProofFormat::JsonEnc => {
                         // Parse the Cairo proof from JSON
                         let proof_str = std::str::from_utf8(&w.proof_data)
                             .map_err(|_| Error::DecodingProofFailed)?;
 
                         serde_json::from_str(proof_str).map_err(|_| Error::DecodingProofFailed)?
                     }
-                    verify::ProofFormat::BinEnc => {
+                    stark_verify::ProofFormat::BinEnc => {
                         // Check if the data is bzip2-compressed (magic bytes 'BZ')
                         let proof_data = if w.proof_data.len() >= 2
                             && w.proof_data[0] == b'B'
@@ -366,8 +455,8 @@ impl<C: Context> Extension<C> for Program {
 
                 // Deserialize BootloaderOutput (first 3 felts) and OsOutputHeader (next 10 felts)
                 let mut iter = public_output.iter();
-                let _bootloader_output = verify::BootloaderOutput::deserialize(&mut iter);
-                let os_header = verify::OsOutputHeader::deserialize(&mut iter);
+                let _bootloader_output = stark_verify::BootloaderOutput::deserialize(&mut iter);
+                let os_header = stark_verify::OsOutputHeader::deserialize(&mut iter);
 
                 // Convert FieldElements to bytes for comparison
                 let proof_initial_root: [u8; 32] = os_header.initial_root.to_bytes_be()
@@ -411,6 +500,8 @@ impl<C: Context> Extension<C> for Program {
 
                 Ok(())
             }
+            // Mismatched precondition/witness pairs
+            _ => Err(Error::ModeInvalid(0)), // Mode 0 is arbitrary here; could add a new error variant
         }
     }
 }
@@ -451,6 +542,42 @@ pub enum StarkVerifyBuildError<E> {
 /// Convenience methods for use with [`zcash_primitives::transaction::builder::Builder`]
 /// for constructing transactions that utilize the stark_verify extension.
 impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
+    /// Add an initialize precondition output to create a new program/channel.
+    /// This output can later be spent by either initialize or stark_verify mode inputs.
+    pub fn add_initialize_output(
+        &mut self,
+        value: Zatoshis,
+        root: [u8; 32],
+        program_hash: [u8; 32],
+    ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
+        self.txn_builder
+            .add_tze_output(self.extension_id, value, &Precondition::initialize(root, program_hash))
+            .map_err(StarkVerifyBuildError::BaseBuilderError)
+    }
+
+    /// Add an initialize witness input to spend an initialize precondition output.
+    /// This mode doesn't require proof verification, just creates a new channel output.
+    pub fn add_initialize_input(
+        &mut self,
+        prevout: (OutPoint, zcash_primitives::transaction::components::tze::TzeOut),
+    ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
+        // Validate that the previous output has an initialize precondition
+        match Precondition::from_payload(
+            prevout.1.precondition.mode,
+            &prevout.1.precondition.payload,
+        ) {
+            Err(parse_failure) => Err(StarkVerifyBuildError::PrevoutParseFailure(parse_failure)),
+            Ok(Precondition::Initialize(_)) => {
+                self.txn_builder
+                    .add_tze_input(self.extension_id, initialize::MODE, prevout, move |_| {
+                        Ok(Witness::initialize())
+                    })
+                    .map_err(StarkVerifyBuildError::BaseBuilderError)
+            }
+            Ok(_) => Err(StarkVerifyBuildError::PrevoutParseFailure(Error::ModeInvalid(prevout.1.precondition.mode))),
+        }
+    }
+
     /// Add a STARK verification precondition output to the transaction.
     pub fn add_stark_verify_output(
         &mut self,
@@ -459,7 +586,7 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         program_hash: [u8; 32],
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         self.txn_builder
-            .add_tze_output(self.extension_id, value, &Precondition::verify(root, program_hash))
+            .add_tze_output(self.extension_id, value, &Precondition::stark_verify(root, program_hash))
             .map_err(StarkVerifyBuildError::BaseBuilderError)
     }
 
@@ -469,21 +596,22 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         prevout: (OutPoint, zcash_primitives::transaction::components::tze::TzeOut),
         proof_data: Vec<u8>,
         with_pedersen: bool,
-        proof_format: verify::ProofFormat,
+        proof_format: stark_verify::ProofFormat,
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
-        // Validate that the previous output has a verify precondition
+        // Validate that the previous output has a stark_verify precondition
         match Precondition::from_payload(
             prevout.1.precondition.mode,
             &prevout.1.precondition.payload,
         ) {
             Err(parse_failure) => Err(StarkVerifyBuildError::PrevoutParseFailure(parse_failure)),
-            Ok(Precondition::Verify(_)) => {
+            Ok(Precondition::StarkVerify(_)) => {
                 self.txn_builder
-                    .add_tze_input(self.extension_id, verify::MODE, prevout, move |_| {
-                        Ok(Witness::verify(proof_data.clone(), with_pedersen, proof_format))
+                    .add_tze_input(self.extension_id, stark_verify::MODE, prevout, move |_| {
+                        Ok(Witness::stark_verify(proof_data.clone(), with_pedersen, proof_format))
                     })
                     .map_err(StarkVerifyBuildError::BaseBuilderError)
             }
+            Ok(_) => Err(StarkVerifyBuildError::PrevoutParseFailure(Error::ModeInvalid(prevout.1.precondition.mode))),
         }
     }
 }
@@ -499,10 +627,10 @@ mod tests {
     };
     use zcash_protocol::{consensus::BranchId, value::Zatoshis};
 
-    use super::{Context, Precondition, Program, Witness, verify};
+    use super::{Context, Precondition, Program, Witness, initialize, stark_verify};
 
     /// Helper function to extract roots and program hash from a Cairo proof for testing
-    fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: verify::ProofFormat) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+    fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: stark_verify::ProofFormat) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
         use bzip2::read::BzDecoder;
         use cairo_air::utils::get_verification_output;
         use cairo_air::CairoProof;
@@ -512,12 +640,12 @@ mod tests {
 
         // Parse the Cairo proof based on the encoding format
         let cairo_proof: CairoProof<Blake2sMerkleHasher> = match proof_format {
-            verify::ProofFormat::JsonEnc => {
+            stark_verify::ProofFormat::JsonEnc => {
                 let proof_str = std::str::from_utf8(proof_data)
                     .map_err(|_| "Failed to decode proof as UTF-8")?;
                 serde_json::from_str(proof_str).map_err(|e| format!("Failed to parse JSON: {}", e))?
             }
-            verify::ProofFormat::BinEnc => {
+            stark_verify::ProofFormat::BinEnc => {
                 // Check if the data is bzip2-compressed
                 let actual_data = if proof_data.len() >= 2 && proof_data[0] == b'B' && proof_data[1] == b'Z' {
                     let mut bz_decoder = BzDecoder::new(proof_data);
@@ -538,8 +666,8 @@ mod tests {
         let public_output = &verification_output.output;
 
         let mut iter = public_output.iter();
-        let _bootloader_output = verify::BootloaderOutput::deserialize(&mut iter);
-        let os_header = verify::OsOutputHeader::deserialize(&mut iter);
+        let _bootloader_output = stark_verify::BootloaderOutput::deserialize(&mut iter);
+        let os_header = stark_verify::OsOutputHeader::deserialize(&mut iter);
 
         let initial_root: [u8; 32] = os_header.initial_root.to_bytes_be()
             .try_into()
@@ -555,15 +683,27 @@ mod tests {
     }
 
     #[test]
-    fn precondition_verify_round_trip() {
+    fn precondition_initialize_round_trip() {
         let root = [7u8; 32];
         let program_hash = [9u8; 32];
         let mut data = Vec::new();
         data.extend_from_slice(&root);
         data.extend_from_slice(&program_hash);
-        let p = Precondition::from_payload(verify::MODE, &data).unwrap();
-        assert_eq!(p, Precondition::verify(root, program_hash));
-        assert_eq!(p.to_payload(), (verify::MODE, data));
+        let p = Precondition::from_payload(initialize::MODE, &data).unwrap();
+        assert_eq!(p, Precondition::initialize(root, program_hash));
+        assert_eq!(p.to_payload(), (initialize::MODE, data));
+    }
+
+    #[test]
+    fn precondition_stark_verify_round_trip() {
+        let root = [7u8; 32];
+        let program_hash = [9u8; 32];
+        let mut data = Vec::new();
+        data.extend_from_slice(&root);
+        data.extend_from_slice(&program_hash);
+        let p = Precondition::from_payload(stark_verify::MODE, &data).unwrap();
+        assert_eq!(p, Precondition::stark_verify(root, program_hash));
+        assert_eq!(p.to_payload(), (stark_verify::MODE, data));
     }
 
     #[test]
@@ -577,46 +717,57 @@ mod tests {
 
     #[test]
     fn precondition_rejects_invalid_payload_length() {
-        // Empty payload should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[]);
-        assert!(p.is_err());
+        // Test both initialize and stark_verify modes
+        for mode in [initialize::MODE, stark_verify::MODE] {
+            // Empty payload should be rejected
+            let p = Precondition::from_payload(mode, &[]);
+            assert!(p.is_err());
 
-        // Wrong length payload should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[1, 2, 3]);
-        assert!(p.is_err());
+            // Wrong length payload should be rejected
+            let p = Precondition::from_payload(mode, &[1, 2, 3]);
+            assert!(p.is_err());
 
-        // 32 bytes should be rejected (need 64 bytes now)
-        let p = Precondition::from_payload(verify::MODE, &[0u8; 32]);
-        assert!(p.is_err());
+            // 32 bytes should be rejected (need 64 bytes now)
+            let p = Precondition::from_payload(mode, &[0u8; 32]);
+            assert!(p.is_err());
 
-        // 63 bytes should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[0u8; 63]);
-        assert!(p.is_err());
+            // 63 bytes should be rejected
+            let p = Precondition::from_payload(mode, &[0u8; 63]);
+            assert!(p.is_err());
 
-        // 65 bytes should be rejected
-        let p = Precondition::from_payload(verify::MODE, &[0u8; 65]);
-        assert!(p.is_err());
+            // 65 bytes should be rejected
+            let p = Precondition::from_payload(mode, &[0u8; 65]);
+            assert!(p.is_err());
+        }
     }
 
     #[test]
-    fn witness_verify_round_trip() {
+    fn witness_initialize_round_trip() {
+        // Initialize witness has no payload
+        let w = Witness::from_payload(initialize::MODE, &[]).unwrap();
+        assert_eq!(w, Witness::initialize());
+        assert_eq!(w.to_payload(), (initialize::MODE, vec![]));
+    }
+
+    #[test]
+    fn witness_stark_verify_round_trip() {
         let proof_data = b"test proof data".to_vec();
         let with_pedersen = false;
-        let proof_format = verify::ProofFormat::JsonEnc;
+        let proof_format = stark_verify::ProofFormat::JsonEnc;
 
         // Create payload: [with_pedersen flag] + [proof_format] + [proof_data]
         let mut payload = vec![
             if with_pedersen { 1 } else { 0 },
             match proof_format {
-                verify::ProofFormat::JsonEnc => 0,
-                verify::ProofFormat::BinEnc => 1,
+                stark_verify::ProofFormat::JsonEnc => 0,
+                stark_verify::ProofFormat::BinEnc => 1,
             },
         ];
         payload.extend_from_slice(&proof_data);
 
-        let w = Witness::from_payload(verify::MODE, &payload).unwrap();
-        assert_eq!(w, Witness::verify(proof_data.clone(), with_pedersen, proof_format));
-        assert_eq!(w.to_payload(), (verify::MODE, payload));
+        let w = Witness::from_payload(stark_verify::MODE, &payload).unwrap();
+        assert_eq!(w, Witness::stark_verify(proof_data.clone(), with_pedersen, proof_format));
+        assert_eq!(w.to_payload(), (stark_verify::MODE, payload));
     }
 
     #[test]
@@ -627,18 +778,26 @@ mod tests {
 
     #[test]
     fn witness_accepts_valid_payload() {
-        // Valid payload with flag and data
-        let w = Witness::from_payload(verify::MODE, &[0, 1, 2, 3]);
+        // Initialize mode accepts empty payload
+        let w = Witness::from_payload(initialize::MODE, &[]);
+        assert!(w.is_ok());
+
+        // StarkVerify mode requires at least 2 bytes: pedersen flag + format byte
+        let w = Witness::from_payload(stark_verify::MODE, &[0, 1, 2, 3]);
         assert!(w.is_ok());
     }
 
     #[test]
     fn witness_rejects_empty_payload() {
-        // Empty payload should be rejected (needs at least 2 bytes: pedersen flag + format byte)
-        let w = Witness::from_payload(verify::MODE, &[]);
+        // Initialize mode should reject non-empty payload
+        let w = Witness::from_payload(initialize::MODE, &[1, 2, 3]);
+        assert!(w.is_err());
+
+        // StarkVerify mode should reject empty payload (needs at least 2 bytes: pedersen flag + format byte)
+        let w = Witness::from_payload(stark_verify::MODE, &[]);
         assert!(w.is_err());
         // Single byte should also be rejected
-        let w = Witness::from_payload(verify::MODE, &[0]);
+        let w = Witness::from_payload(stark_verify::MODE, &[0]);
         assert!(w.is_err());
     }
 
@@ -666,7 +825,7 @@ mod tests {
         // Create a simple transaction with STARK verify TZE input and output
         let out_a = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -692,12 +851,12 @@ mod tests {
         // Create spending transaction with a dummy witness and output (just for structural test)
         let in_witness = TzeIn {
             prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(vec![1, 2, 3], false, verify::ProofFormat::JsonEnc)),
+            witness: tze::Witness::from(0, &Witness::stark_verify(vec![1, 2, 3], false, stark_verify::ProofFormat::JsonEnc)),
         };
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -754,7 +913,7 @@ mod tests {
         let (initial_root, final_root, program_hash) = extract_data_from_proof(
             &proof_data,
             true,
-            verify::ProofFormat::JsonEnc
+            stark_verify::ProofFormat::JsonEnc
         ).expect("Failed to extract data from proof");
 
         //
@@ -762,7 +921,7 @@ mod tests {
         //
         let out = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -790,12 +949,12 @@ mod tests {
         //
         let in_witness = TzeIn {
             prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::JsonEnc)),
+            witness: tze::Witness::from(0, &Witness::stark_verify(proof_data, true, stark_verify::ProofFormat::JsonEnc)),
         };
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -852,13 +1011,13 @@ mod tests {
         let (initial_root, final_root, program_hash) = extract_data_from_proof(
             &proof_data,
             true,
-            verify::ProofFormat::BinEnc
+            stark_verify::ProofFormat::BinEnc
         ).expect("Failed to extract data from proof");
 
         // Create a transaction with a STARK verification precondition output
         let out = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(initial_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, program_hash)),
         };
 
         let tx_a = TransactionData::from_parts_zfuture(
@@ -884,12 +1043,12 @@ mod tests {
         // Create a spending transaction with the STARK proof witness (binary encoded) and output with final root
         let in_witness = TzeIn {
             prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::BinEnc)),
+            witness: tze::Witness::from(0, &Witness::stark_verify(proof_data, true, stark_verify::ProofFormat::BinEnc)),
         };
 
         let out_b = TzeOut {
             value: Zatoshis::from_u64(100000).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -940,7 +1099,7 @@ mod tests {
         // Create a transaction with TZE output for context
         let out = TzeOut {
             value: Zatoshis::from_u64(1).unwrap(),
-            precondition: tze::Precondition::from(0, &Precondition::verify(final_root, program_hash)),
+            precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
         };
 
         let tx = TransactionData::from_parts_zfuture(
@@ -964,11 +1123,11 @@ mod tests {
         .unwrap();
 
         let ctx = Ctx { tx: &tx };
-        let precondition = Precondition::verify(initial_root, program_hash);
+        let precondition = Precondition::stark_verify(initial_root, program_hash);
 
         // Test 1: Invalid JSON should fail at parsing stage
         let invalid_json = b"{invalid json}".to_vec();
-        let witness = Witness::verify(invalid_json, false, verify::ProofFormat::JsonEnc);
+        let witness = Witness::stark_verify(invalid_json, false, stark_verify::ProofFormat::JsonEnc);
         let result = Program.verify_inner(&precondition, &witness, &ctx);
         assert!(
             result.is_err(),
@@ -977,7 +1136,7 @@ mod tests {
 
         // Test 2: Valid JSON but not a proof should fail
         let not_a_proof = br#"{"foo": "bar"}"#.to_vec();
-        let witness = Witness::verify(not_a_proof, false, verify::ProofFormat::JsonEnc);
+        let witness = Witness::stark_verify(not_a_proof, false, stark_verify::ProofFormat::JsonEnc);
         let result = Program.verify_inner(&precondition, &witness, &ctx);
         assert!(
             result.is_err(),
