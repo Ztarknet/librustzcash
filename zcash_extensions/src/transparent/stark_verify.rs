@@ -25,6 +25,16 @@ use zcash_protocol::value::Zatoshis;
 mod verify {
     pub const MODE: u32 = 0;
 
+    /// Proof encoding format
+    /// TEMPORARY: This field will be removed once we settle on a single encoding format
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub enum ProofFormat {
+        /// JSON-encoded proof data
+        JsonEnc,
+        /// Binary-encoded proof data (bincode)
+        BinEnc,
+    }
+
     /// Precondition for STARK verification.
     /// Currently empty, will later contain verification key and public inputs.
     #[derive(Debug, PartialEq, Eq, Clone)]
@@ -34,16 +44,20 @@ mod verify {
     /// Contains the serialized Cairo proof data and metadata for verification.
     #[derive(Debug, Clone)]
     pub struct Witness {
-        /// Serialized Cairo proof (JSON format)
+        /// Serialized Cairo proof data
         pub proof_data: Vec<u8>,
         /// Whether the proof includes Pedersen builtin
         pub with_pedersen: bool,
+        /// TEMPORARY: Proof encoding format (to be removed once we settle on one format)
+        pub proof_format: ProofFormat,
     }
 
     // Manual PartialEq implementation since we need to compare the struct
     impl PartialEq for Witness {
         fn eq(&self, other: &Self) -> bool {
-            self.proof_data == other.proof_data && self.with_pedersen == other.with_pedersen
+            self.proof_data == other.proof_data
+                && self.with_pedersen == other.with_pedersen
+                && self.proof_format == other.proof_format
         }
     }
 
@@ -71,6 +85,8 @@ pub enum Error {
     IllegalPayloadLength(usize),
     /// Verification error indicating that the specified mode was not recognized.
     ModeInvalid(u32),
+    /// Decoding error indicating that the proof data could not be deserialized.
+    DecodingProofFailed,
     /// Verification error indicating that the witness being verified did not
     /// satisfy the precondition.
     VerificationFailed,
@@ -83,6 +99,7 @@ impl fmt::Display for Error {
                 write!(f, "Illegal payload length for stark_verify: {}", sz)
             }
             Error::ModeInvalid(m) => write!(f, "Invalid TZE mode for stark_verify: {}", m),
+            Error::DecodingProofFailed => write!(f, "Failed to decode/deserialize STARK proof"),
             Error::VerificationFailed => write!(f, "STARK verification failed"),
         }
     }
@@ -133,10 +150,11 @@ pub enum Witness {
 
 impl Witness {
     /// Convenience constructor for verify witness values.
-    pub fn verify(proof_data: Vec<u8>, with_pedersen: bool) -> Self {
+    pub fn verify(proof_data: Vec<u8>, with_pedersen: bool, proof_format: verify::ProofFormat) -> Self {
         Witness::Verify(verify::Witness {
             proof_data,
             with_pedersen,
+            proof_format,
         })
     }
 }
@@ -158,15 +176,20 @@ impl FromPayload for Witness {
     fn from_payload(mode: u32, payload: &[u8]) -> Result<Self, Self::Error> {
         match mode {
             verify::MODE => {
-                // Payload format: [with_pedersen (1 byte)] + [proof_data]
-                if payload.is_empty() {
-                    return Err(Error::IllegalPayloadLength(0));
+                // Payload format: [with_pedersen (1 byte)] + [proof_format (1 byte)] + [proof_data]
+                if payload.len() < 2 {
+                    return Err(Error::IllegalPayloadLength(payload.len()));
                 }
 
                 let with_pedersen = payload[0] != 0;
-                let proof_data = payload[1..].to_vec();
+                let proof_format = match payload[1] {
+                    0 => verify::ProofFormat::JsonEnc,
+                    1 => verify::ProofFormat::BinEnc,
+                    _ => return Err(Error::IllegalPayloadLength(payload.len())),
+                };
+                let proof_data = payload[2..].to_vec();
 
-                Ok(Witness::verify(proof_data, with_pedersen))
+                Ok(Witness::verify(proof_data, with_pedersen, proof_format))
             }
             _ => Err(Error::ModeInvalid(mode)),
         }
@@ -177,7 +200,13 @@ impl ToPayload for Witness {
     fn to_payload(&self) -> (u32, Vec<u8>) {
         match self {
             Witness::Verify(w) => {
-                let mut payload = vec![if w.with_pedersen { 1 } else { 0 }];
+                let mut payload = vec![
+                    if w.with_pedersen { 1 } else { 0 },
+                    match w.proof_format {
+                        verify::ProofFormat::JsonEnc => 0,
+                        verify::ProofFormat::BinEnc => 1,
+                    },
+                ];
                 payload.extend_from_slice(&w.proof_data);
                 (verify::MODE, payload)
             }
@@ -213,12 +242,21 @@ impl<C: Context> Extension<C> for Program {
     ) -> Result<(), Error> {
         match (precondition, witness) {
             (Precondition::Verify(_), Witness::Verify(w)) => {
-                // Parse the Cairo proof from JSON
-                let proof_str = std::str::from_utf8(&w.proof_data)
-                    .map_err(|_| Error::VerificationFailed)?;
+                // Parse the Cairo proof based on the encoding format
+                let cairo_proof: CairoProof<Blake2sMerkleHasher> = match w.proof_format {
+                    verify::ProofFormat::JsonEnc => {
+                        // Parse the Cairo proof from JSON
+                        let proof_str = std::str::from_utf8(&w.proof_data)
+                            .map_err(|_| Error::DecodingProofFailed)?;
 
-                let cairo_proof: CairoProof<Blake2sMerkleHasher> =
-                    serde_json::from_str(proof_str).map_err(|_| Error::VerificationFailed)?;
+                        serde_json::from_str(proof_str).map_err(|_| Error::DecodingProofFailed)?
+                    }
+                    verify::ProofFormat::BinEnc => {
+                        // Deserialize the Cairo proof from binary encoding
+                        bincode::deserialize(&w.proof_data)
+                            .map_err(|_| Error::DecodingProofFailed)?
+                    }
+                };
 
                 // Determine the preprocessed trace variant based on Pedersen flag
                 let preprocessed_trace = if w.with_pedersen {
@@ -292,6 +330,7 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         prevout: (OutPoint, zcash_primitives::transaction::components::tze::TzeOut),
         proof_data: Vec<u8>,
         with_pedersen: bool,
+        proof_format: verify::ProofFormat,
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         // Validate that the previous output has a verify precondition
         match Precondition::from_payload(
@@ -302,7 +341,7 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
             Ok(Precondition::Verify(_)) => {
                 self.txn_builder
                     .add_tze_input(self.extension_id, verify::MODE, prevout, move |_| {
-                        Ok(Witness::verify(proof_data.clone(), with_pedersen))
+                        Ok(Witness::verify(proof_data.clone(), with_pedersen, proof_format))
                     })
                     .map_err(StarkVerifyBuildError::BaseBuilderError)
             }
@@ -312,6 +351,8 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use bzip2::read::BzDecoder;
     use zcash_primitives::{
         extensions::transparent::{self as tze, Extension, FromPayload, ToPayload},
         transaction::{
@@ -347,13 +388,20 @@ mod tests {
     fn witness_verify_round_trip() {
         let proof_data = b"test proof data".to_vec();
         let with_pedersen = false;
+        let proof_format = verify::ProofFormat::JsonEnc;
 
-        // Create payload: [with_pedersen flag] + [proof_data]
-        let mut payload = vec![if with_pedersen { 1 } else { 0 }];
+        // Create payload: [with_pedersen flag] + [proof_format] + [proof_data]
+        let mut payload = vec![
+            if with_pedersen { 1 } else { 0 },
+            match proof_format {
+                verify::ProofFormat::JsonEnc => 0,
+                verify::ProofFormat::BinEnc => 1,
+            },
+        ];
         payload.extend_from_slice(&proof_data);
 
         let w = Witness::from_payload(verify::MODE, &payload).unwrap();
-        assert_eq!(w, Witness::verify(proof_data.clone(), with_pedersen));
+        assert_eq!(w, Witness::verify(proof_data.clone(), with_pedersen, proof_format));
         assert_eq!(w.to_payload(), (verify::MODE, payload));
     }
 
@@ -372,8 +420,11 @@ mod tests {
 
     #[test]
     fn witness_rejects_empty_payload() {
-        // Empty payload should be rejected (needs at least the flag byte)
+        // Empty payload should be rejected (needs at least 2 bytes: pedersen flag + format byte)
         let w = Witness::from_payload(verify::MODE, &[]);
+        assert!(w.is_err());
+        // Single byte should also be rejected
+        let w = Witness::from_payload(verify::MODE, &[0]);
         assert!(w.is_err());
     }
 
@@ -412,7 +463,7 @@ mod tests {
         // Create spending transaction with a dummy witness (just for structural test)
         let in_witness = TzeIn {
             prevout: OutPoint::new(tx.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(vec![1, 2, 3], false)),
+            witness: tze::Witness::from(0, &Witness::verify(vec![1, 2, 3], false, verify::ProofFormat::JsonEnc)),
         };
 
         let tx_spend = TransactionData::from_parts_zfuture(
@@ -492,7 +543,7 @@ mod tests {
         //
         let in_witness = TzeIn {
             prevout: OutPoint::new(tx_a.txid(), 0),
-            witness: tze::Witness::from(0, &Witness::verify(proof_data, true)),
+            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::JsonEnc)),
         };
 
         let tx_b = TransactionData::from_parts_zfuture(
@@ -534,6 +585,89 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn verify_proof_sepolia() {
+        // Load the embedded proof from test fixtures
+        //
+        // Generated using this command inside Ztarknet/gpp:
+        // cargo run -- -b 2725346 -n sepolia
+        let proof_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/proof-sepolia-2725346.bz");
+        let file = std::fs::File::open(proof_file)
+            .expect("Failed to open compressed proof file");
+        let mut bz_decoder = BzDecoder::new(file);
+        let mut proof_data = Vec::new();
+        bz_decoder
+            .read_to_end(&mut proof_data)
+            .expect("Failed to read and decompress proof data");
+
+        // Create a transaction with a STARK verification precondition output
+        let out = TzeOut {
+            value: Zatoshis::from_u64(100000).unwrap(),
+            precondition: tze::Precondition::from(0, &Precondition::verify()),
+        };
+
+        let tx_a = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![],
+                vout: vec![out],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Create a spending transaction with the STARK proof witness (binary encoded)
+        let in_witness = TzeIn {
+            prevout: OutPoint::new(tx_a.txid(), 0),
+            witness: tze::Witness::from(0, &Witness::verify(proof_data, true, verify::ProofFormat::BinEnc)),
+        };
+        let tx_b = TransactionData::from_parts_zfuture(
+            TxVersion::ZFuture,
+            BranchId::ZFuture,
+            0,
+            0u32.into(),
+            #[cfg(feature = "zip-233")]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+            Some(Bundle {
+                vin: vec![in_witness],
+                vout: vec![],
+                authorization: Authorized,
+            }),
+        )
+        .freeze()
+        .unwrap();
+
+        // Verify the spending transaction using the full verification path
+        let ctx = Ctx;
+        let result = Program.verify(
+            &tx_a.tze_bundle().unwrap().vout[0].precondition,
+            &tx_b.tze_bundle().unwrap().vin[0].witness,
+            &ctx,
+        );
+        // The proof should verify successfully
+        assert!(
+            result.is_ok(),
+            "STARK proof verification failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn verify_inner_basic_flow() {
         // This test demonstrates that the verify_inner function is properly wired up
         // and can parse/verify proofs. It expects failure with invalid proof data,
@@ -544,7 +678,7 @@ mod tests {
 
         // Test 1: Invalid JSON should fail at parsing stage
         let invalid_json = b"{invalid json}".to_vec();
-        let witness = Witness::verify(invalid_json, false);
+        let witness = Witness::verify(invalid_json, false, verify::ProofFormat::JsonEnc);
         let result = Program.verify_inner(&precondition, &witness, &ctx);
         assert!(
             result.is_err(),
@@ -553,7 +687,7 @@ mod tests {
 
         // Test 2: Valid JSON but not a proof should fail
         let not_a_proof = br#"{"foo": "bar"}"#.to_vec();
-        let witness = Witness::verify(not_a_proof, false);
+        let witness = Witness::verify(not_a_proof, false, verify::ProofFormat::JsonEnc);
         let result = Program.verify_inner(&precondition, &witness, &ctx);
         assert!(
             result.is_err(),
