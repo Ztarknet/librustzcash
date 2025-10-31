@@ -8,9 +8,11 @@
 //! the structural foundation for proper STARK verification.
 
 use std::fmt;
+use std::io::Read;
 use std::ops::{Deref, DerefMut};
 
 // Stwo Cairo imports for STARK verification
+use bzip2::read::BzDecoder;
 use cairo_air::verifier::verify_cairo;
 use cairo_air::{CairoProof, PreProcessedTraceVariant};
 use stwo::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
@@ -252,8 +254,24 @@ impl<C: Context> Extension<C> for Program {
                         serde_json::from_str(proof_str).map_err(|_| Error::DecodingProofFailed)?
                     }
                     verify::ProofFormat::BinEnc => {
+                        // Check if the data is bzip2-compressed (magic bytes 'BZ')
+                        let proof_data = if w.proof_data.len() >= 2
+                            && w.proof_data[0] == b'B'
+                            && w.proof_data[1] == b'Z' {
+                            // Data is bzip2-compressed, decompress it
+                            let mut bz_decoder = BzDecoder::new(&w.proof_data[..]);
+                            let mut decompressed = Vec::new();
+                            bz_decoder
+                                .read_to_end(&mut decompressed)
+                                .map_err(|_| Error::DecodingProofFailed)?;
+                            decompressed
+                        } else {
+                            // Data is not compressed, use as-is
+                            w.proof_data.clone()
+                        };
+
                         // Deserialize the Cairo proof from binary encoding
-                        bincode::deserialize(&w.proof_data)
+                        bincode::deserialize(&proof_data)
                             .map_err(|_| Error::DecodingProofFailed)?
                     }
                 };
@@ -351,8 +369,6 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-    use bzip2::read::BzDecoder;
     use zcash_primitives::{
         extensions::transparent::{self as tze, Extension, FromPayload, ToPayload},
         transaction::{
@@ -586,19 +602,14 @@ mod tests {
 
     #[test]
     fn verify_proof_sepolia() {
-        // Load the embedded proof from test fixtures
+        // Load the compressed proof from test fixtures
         //
         // Generated using this command inside Ztarknet/gpp:
         // cargo run -- -b 2725346 -n sepolia
         let proof_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/proof-sepolia-2725346.bz");
-        let file = std::fs::File::open(proof_file)
-            .expect("Failed to open compressed proof file");
-        let mut bz_decoder = BzDecoder::new(file);
-        let mut proof_data = Vec::new();
-        bz_decoder
-            .read_to_end(&mut proof_data)
-            .expect("Failed to read and decompress proof data");
+        let proof_data = std::fs::read(proof_file)
+            .expect("Failed to read compressed proof file");
 
         // Create a transaction with a STARK verification precondition output
         let out = TzeOut {
