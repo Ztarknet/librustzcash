@@ -9,8 +9,8 @@ use zcash_protocol::{consensus::BranchId, value::Zatoshis};
 
 use super::{Context, Precondition, Program, Witness, modes};
 
-/// Helper function to extract roots and program hash from a Cairo proof for testing
-fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: modes::verify::ProofFormat) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+/// Helper function to extract roots and program hashes from a Cairo proof for testing
+fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format: modes::verify::ProofFormat) -> Result<([u8; 32], [u8; 32], [u8; 32], [u8; 32]), String> {
     use bzip2::read::BzDecoder;
     use cairo_air::utils::get_verification_output;
     use cairo_air::CairoProof;
@@ -46,7 +46,7 @@ fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format
     let public_output = &verification_output.output;
 
     let mut iter = public_output.iter();
-    let _bootloader_output = modes::verify::BootloaderOutput::deserialize(&mut iter);
+    let bootloader_output = modes::verify::BootloaderOutput::deserialize(&mut iter);
     let os_header = modes::verify::OsOutputHeader::deserialize(&mut iter);
 
     let initial_root: [u8; 32] = os_header.initial_root.to_bytes_be()
@@ -55,42 +55,50 @@ fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format
     let final_root: [u8; 32] = os_header.final_root.to_bytes_be()
         .try_into()
         .map_err(|_| "Failed to convert final_root to bytes")?;
-    let program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be()
+    let os_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be()
         .try_into()
         .map_err(|_| "Failed to convert os_program_hash to bytes")?;
+    let bootloader_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be()
+        .try_into()
+        .map_err(|_| "Failed to convert bootloader_program_hash to bytes")?;
 
-    Ok((initial_root, final_root, program_hash))
+    Ok((initial_root, final_root, os_program_hash, bootloader_program_hash))
 }
 
 #[test]
 fn precondition_initialize_round_trip() {
     let root = [7u8; 32];
-    let program_hash = [9u8; 32];
+    let os_program_hash = [9u8; 32];
+    let bootloader_program_hash = [11u8; 32];
     let mut data = Vec::new();
     data.extend_from_slice(&root);
-    data.extend_from_slice(&program_hash);
+    data.extend_from_slice(&os_program_hash);
+    data.extend_from_slice(&bootloader_program_hash);
     let p = Precondition::from_payload(modes::initialize::MODE, &data).unwrap();
-    assert_eq!(p, Precondition::initialize(root, program_hash));
+    assert_eq!(p, Precondition::initialize(root, os_program_hash, bootloader_program_hash));
     assert_eq!(p.to_payload(), (modes::initialize::MODE, data));
 }
 
 #[test]
 fn precondition_stark_verify_round_trip() {
     let root = [7u8; 32];
-    let program_hash = [9u8; 32];
+    let os_program_hash = [9u8; 32];
+    let bootloader_program_hash = [11u8; 32];
     let mut data = Vec::new();
     data.extend_from_slice(&root);
-    data.extend_from_slice(&program_hash);
+    data.extend_from_slice(&os_program_hash);
+    data.extend_from_slice(&bootloader_program_hash);
     let p = Precondition::from_payload(modes::verify::MODE, &data).unwrap();
-    assert_eq!(p, Precondition::stark_verify(root, program_hash));
+    assert_eq!(p, Precondition::stark_verify(root, os_program_hash, bootloader_program_hash));
     assert_eq!(p.to_payload(), (modes::verify::MODE, data));
 }
 
 #[test]
 fn precondition_rejects_invalid_mode() {
-    let mut data = [0u8; 64];
+    let mut data = [0u8; 96];
     data[..32].copy_from_slice(&[7u8; 32]);
-    data[32..].copy_from_slice(&[9u8; 32]);
+    data[32..64].copy_from_slice(&[9u8; 32]);
+    data[64..].copy_from_slice(&[11u8; 32]);
     let p = Precondition::from_payload(99, &data);
     assert!(p.is_err());
 }
@@ -107,16 +115,20 @@ fn precondition_rejects_invalid_payload_length() {
         let p = Precondition::from_payload(mode, &[1, 2, 3]);
         assert!(p.is_err());
 
-        // 32 bytes should be rejected (need 64 bytes now)
+        // 32 bytes should be rejected (need 96 bytes now)
         let p = Precondition::from_payload(mode, &[0u8; 32]);
         assert!(p.is_err());
 
-        // 63 bytes should be rejected
-        let p = Precondition::from_payload(mode, &[0u8; 63]);
+        // 64 bytes should be rejected (need 96 bytes now)
+        let p = Precondition::from_payload(mode, &[0u8; 64]);
         assert!(p.is_err());
 
-        // 65 bytes should be rejected
-        let p = Precondition::from_payload(mode, &[0u8; 65]);
+        // 95 bytes should be rejected
+        let p = Precondition::from_payload(mode, &[0u8; 95]);
+        assert!(p.is_err());
+
+        // 97 bytes should be rejected
+        let p = Precondition::from_payload(mode, &[0u8; 97]);
         assert!(p.is_err());
     }
 }
@@ -197,15 +209,16 @@ impl<'a> Context for Ctx<'a> {
 
 #[test]
 fn stark_verify_program_succeeds() {
-    // Use dummy roots and program hash for testing
+    // Use dummy roots and program hashes for testing
     let initial_root = [1u8; 32];
     let final_root = [2u8; 32];
-    let program_hash = [3u8; 32];
+    let os_program_hash = [3u8; 32];
+    let bootloader_program_hash = [4u8; 32];
 
     // Create a simple transaction with STARK verify TZE input and output
     let out_a = TzeOut {
         value: Zatoshis::from_u64(1).unwrap(),
-        precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, program_hash)),
+        precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, os_program_hash, bootloader_program_hash)),
     };
 
     let tx_a = TransactionData::from_parts_zfuture(
@@ -236,7 +249,7 @@ fn stark_verify_program_succeeds() {
 
     let out_b = TzeOut {
         value: Zatoshis::from_u64(1).unwrap(),
-        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
+        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, os_program_hash, bootloader_program_hash)),
     };
 
     let tx_b = TransactionData::from_parts_zfuture(
@@ -282,8 +295,8 @@ fn verify_proof_sepolia() {
     let proof_data = std::fs::read(proof_file)
         .expect("Failed to read compressed proof file");
 
-    // Extract roots and program hash from the proof
-    let (initial_root, final_root, program_hash) = extract_data_from_proof(
+    // Extract roots and program hashes from the proof
+    let (initial_root, final_root, os_program_hash, bootloader_program_hash) = extract_data_from_proof(
         &proof_data,
         true,
         modes::verify::ProofFormat::BinEnc
@@ -292,7 +305,7 @@ fn verify_proof_sepolia() {
     // Create a transaction with a STARK verification precondition output
     let out = TzeOut {
         value: Zatoshis::from_u64(100000).unwrap(),
-        precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, program_hash)),
+        precondition: tze::Precondition::from(0, &Precondition::stark_verify(initial_root, os_program_hash, bootloader_program_hash)),
     };
 
     let tx_a = TransactionData::from_parts_zfuture(
@@ -323,7 +336,7 @@ fn verify_proof_sepolia() {
 
     let out_b = TzeOut {
         value: Zatoshis::from_u64(100000).unwrap(),
-        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
+        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, os_program_hash, bootloader_program_hash)),
     };
 
     let tx_b = TransactionData::from_parts_zfuture(
@@ -369,12 +382,13 @@ fn verify_inner_basic_flow() {
 
     let initial_root = [1u8; 32];
     let final_root = [2u8; 32];
-    let program_hash = [3u8; 32];
+    let os_program_hash = [3u8; 32];
+    let bootloader_program_hash = [4u8; 32];
 
     // Create a transaction with TZE output for context
     let out = TzeOut {
         value: Zatoshis::from_u64(1).unwrap(),
-        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, program_hash)),
+        precondition: tze::Precondition::from(0, &Precondition::stark_verify(final_root, os_program_hash, bootloader_program_hash)),
     };
 
     let tx = TransactionData::from_parts_zfuture(
@@ -398,7 +412,7 @@ fn verify_inner_basic_flow() {
     .unwrap();
 
     let ctx = Ctx { tx: &tx };
-    let precondition = Precondition::stark_verify(initial_root, program_hash);
+    let precondition = Precondition::stark_verify(initial_root, os_program_hash, bootloader_program_hash);
 
     // Test 1: Invalid JSON should fail at parsing stage
     let invalid_json = b"{invalid json}".to_vec();

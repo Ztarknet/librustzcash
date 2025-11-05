@@ -26,36 +26,41 @@ pub enum ProofFormat {
 }
 
 /// Precondition for STARK verification.
-/// Contains the state root and program hash that must be verified against the proof.
+/// Contains the state root and program hashes that must be verified against the proof.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Precondition {
     /// State root (32 bytes)
     pub root: [u8; 32],
-    /// Program hash (32 bytes)
-    pub program_hash: [u8; 32],
+    /// OS program hash (32 bytes)
+    pub os_program_hash: [u8; 32],
+    /// Bootloader program hash (32 bytes)
+    pub bootloader_program_hash: [u8; 32],
 }
 
 impl Precondition {
     /// Deserialize a precondition from a payload.
-    /// Expects 64 bytes: 32 for root + 32 for program_hash.
+    /// Expects 96 bytes: 32 for root + 32 for os_program_hash + 32 for bootloader_program_hash.
     pub fn from_payload(payload: &[u8]) -> Result<Self, Error> {
-        if payload.len() == 64 {
+        if payload.len() == 96 {
             let mut root = [0u8; 32];
-            let mut program_hash = [0u8; 32];
+            let mut os_program_hash = [0u8; 32];
+            let mut bootloader_program_hash = [0u8; 32];
             root.copy_from_slice(&payload[0..32]);
-            program_hash.copy_from_slice(&payload[32..64]);
-            Ok(Precondition { root, program_hash })
+            os_program_hash.copy_from_slice(&payload[32..64]);
+            bootloader_program_hash.copy_from_slice(&payload[64..96]);
+            Ok(Precondition { root, os_program_hash, bootloader_program_hash })
         } else {
             Err(Error::IllegalPayloadLength(payload.len()))
         }
     }
 
     /// Serialize the precondition to a payload.
-    /// Returns 64 bytes: 32 for root + 32 for program_hash.
+    /// Returns 96 bytes: 32 for root + 32 for os_program_hash + 32 for bootloader_program_hash.
     pub fn to_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(64);
+        let mut payload = Vec::with_capacity(96);
         payload.extend_from_slice(&self.root);
-        payload.extend_from_slice(&self.program_hash);
+        payload.extend_from_slice(&self.os_program_hash);
+        payload.extend_from_slice(&self.bootloader_program_hash);
         payload
     }
 }
@@ -148,29 +153,30 @@ impl Witness {
 ///
 /// This performs full STARK proof verification:
 /// 1. Parses the Cairo proof from the witness
-/// 2. Extracts public outputs (initial/final roots, program hash)
-/// 3. Validates roots and program hash against input/output preconditions
+/// 2. Extracts public outputs (initial/final roots, OS program hash, bootloader program hash)
+/// 3. Validates roots and program hashes against input/output preconditions
 /// 4. Verifies the STARK proof cryptographically
 pub fn verify_program(
     precondition: &Precondition,
     witness: &Witness,
     context: &impl Context,
 ) -> Result<(), Error> {
-    // 1. Get the input_initial_root and input_program_hash from the input precondition
+    // 1. Get the input_initial_root and input_program_hashes from the input precondition
     let input_initial_root = precondition.root;
-    let input_program_hash = precondition.program_hash;
+    let input_os_program_hash = precondition.os_program_hash;
+    let input_bootloader_program_hash = precondition.bootloader_program_hash;
 
     // 2. Check that there is exactly one TZE output and get its precondition
     let outputs = context.tx_tze_outputs();
-    let (output_final_root, output_program_hash) = match outputs {
+    let (output_final_root, output_os_program_hash, output_bootloader_program_hash) = match outputs {
         [tze_out] => {
-            // Parse the output precondition to get the final root and program hash
+            // Parse the output precondition to get the final root and program hashes
             match crate::transparent::stark_verify::Precondition::from_payload(
                 tze_out.precondition.mode,
                 &tze_out.precondition.payload,
             ) {
                 Ok(crate::transparent::stark_verify::Precondition::StarkVerify(p_output)) => {
-                    (p_output.root, p_output.program_hash)
+                    (p_output.root, p_output.os_program_hash, p_output.bootloader_program_hash)
                 }
                 Ok(crate::transparent::stark_verify::Precondition::Initialize(_)) => {
                     return Err(Error::OutputPreconditionParseFailure)
@@ -213,20 +219,21 @@ pub fn verify_program(
         }
     };
 
-    // 4. Parse the proof's public output to get the roots and program hash from the proof
+    // 4. Parse the proof's public output to get the roots and program hashes from the proof
     let verification_output =
         get_verification_output(&cairo_proof.claim.public_data.public_memory);
     let public_output = &verification_output.output;
 
     // Deserialize BootloaderOutput (first 3 felts) and OsOutputHeader (next 10 felts)
     let mut iter = public_output.iter();
-    let _bootloader_output = BootloaderOutput::deserialize(&mut iter);
+    let bootloader_output = BootloaderOutput::deserialize(&mut iter);
     let os_header = OsOutputHeader::deserialize(&mut iter);
 
     // Convert FieldElements to bytes for comparison
     let proof_initial_root: [u8; 32] = os_header.initial_root.to_bytes_be();
     let proof_final_root: [u8; 32] = os_header.final_root.to_bytes_be();
-    let proof_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be();
+    let proof_os_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be();
+    let proof_bootloader_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be();
 
     // 5. Verify that input_initial_root == os_header.initial_root
     if input_initial_root != proof_initial_root {
@@ -238,19 +245,24 @@ pub fn verify_program(
         return Err(Error::FinalRootMismatch);
     }
 
-    // 7. Verify program hash consistency across input, output, and proof
-    if input_program_hash != output_program_hash || input_program_hash != proof_program_hash {
-        return Err(Error::ProgramHashMismatch);
+    // 7. Verify OS program hash consistency across input, output, and proof
+    if input_os_program_hash != output_os_program_hash || input_os_program_hash != proof_os_program_hash {
+        return Err(Error::OsProgramHashMismatch);
     }
 
-    // 8. Determine the preprocessed trace variant based on Pedersen flag
+    // 8. Verify bootloader program hash consistency across input, output, and proof
+    if input_bootloader_program_hash != output_bootloader_program_hash || input_bootloader_program_hash != proof_bootloader_program_hash {
+        return Err(Error::BootloaderHashMismatch);
+    }
+
+    // 9. Determine the preprocessed trace variant based on Pedersen flag
     let preprocessed_trace = if witness.with_pedersen {
         PreProcessedTraceVariant::Canonical
     } else {
         PreProcessedTraceVariant::CanonicalWithoutPedersen
     };
 
-    // 9. Verify the STARK proof (matching cairo-prove CLI exactly)
+    // 10. Verify the STARK proof (matching cairo-prove CLI exactly)
     verify_cairo::<Blake2sMerkleChannel>(cairo_proof, preprocessed_trace)
         .map_err(|_| Error::VerificationFailed)?;
 

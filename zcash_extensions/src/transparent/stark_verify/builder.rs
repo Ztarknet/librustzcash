@@ -55,10 +55,11 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         &mut self,
         value: Zatoshis,
         root: [u8; 32],
-        program_hash: [u8; 32],
+        os_program_hash: [u8; 32],
+        bootloader_program_hash: [u8; 32],
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         self.txn_builder
-            .add_tze_output(self.extension_id, value, &Precondition::initialize(root, program_hash))
+            .add_tze_output(self.extension_id, value, &Precondition::initialize(root, os_program_hash, bootloader_program_hash))
             .map_err(StarkVerifyBuildError::BaseBuilderError)
     }
 
@@ -90,10 +91,11 @@ impl<'a, B: ExtensionTxBuilder<'a>> StarkVerifyBuilder<B> {
         &mut self,
         value: Zatoshis,
         root: [u8; 32],
-        program_hash: [u8; 32],
+        os_program_hash: [u8; 32],
+        bootloader_program_hash: [u8; 32],
     ) -> Result<(), StarkVerifyBuildError<B::BuildError>> {
         self.txn_builder
-            .add_tze_output(self.extension_id, value, &Precondition::stark_verify(root, program_hash))
+            .add_tze_output(self.extension_id, value, &Precondition::stark_verify(root, os_program_hash, bootloader_program_hash))
             .map_err(StarkVerifyBuildError::BaseBuilderError)
     }
 

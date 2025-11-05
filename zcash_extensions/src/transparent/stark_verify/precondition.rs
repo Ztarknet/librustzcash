@@ -11,13 +11,13 @@ pub enum Precondition {
 
 impl Precondition {
     /// Convenience constructor for initialize precondition values.
-    pub fn initialize(root: [u8; 32], program_hash: [u8; 32]) -> Self {
-        Precondition::Initialize(modes::initialize::Precondition { root, program_hash })
+    pub fn initialize(root: [u8; 32], os_program_hash: [u8; 32], bootloader_program_hash: [u8; 32]) -> Self {
+        Precondition::Initialize(modes::initialize::Precondition { root, os_program_hash, bootloader_program_hash })
     }
 
     /// Convenience constructor for stark_verify precondition values.
-    pub fn stark_verify(root: [u8; 32], program_hash: [u8; 32]) -> Self {
-        Precondition::StarkVerify(modes::verify::Precondition { root, program_hash })
+    pub fn stark_verify(root: [u8; 32], os_program_hash: [u8; 32], bootloader_program_hash: [u8; 32]) -> Self {
+        Precondition::StarkVerify(modes::verify::Precondition { root, os_program_hash, bootloader_program_hash })
     }
 }
 

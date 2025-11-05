@@ -23,8 +23,10 @@ pub enum Error {
     OutputPreconditionParseFailure,
     /// Verification error indicating that the proof public output could not be parsed.
     PublicOutputParseFailure,
-    /// Verification error indicating that program hashes don't match across input, output, and proof.
-    ProgramHashMismatch,
+    /// Verification error indicating that OS program hashes don't match across input, output, and proof.
+    OsProgramHashMismatch,
+    /// Verification error indicating that bootloader program hashes don't match across input, output, and proof.
+    BootloaderHashMismatch,
 }
 
 impl fmt::Display for Error {
@@ -41,7 +43,8 @@ impl fmt::Display for Error {
             Error::FinalRootMismatch => write!(f, "Final root from output doesn't match proof"),
             Error::OutputPreconditionParseFailure => write!(f, "Failed to parse output precondition"),
             Error::PublicOutputParseFailure => write!(f, "Failed to parse proof public output"),
-            Error::ProgramHashMismatch => write!(f, "Program hash mismatch between input, output, and proof"),
+            Error::OsProgramHashMismatch => write!(f, "OS program hash mismatch between input, output, and proof"),
+            Error::BootloaderHashMismatch => write!(f, "Bootloader program hash mismatch between input, output, and proof"),
         }
     }
 }
