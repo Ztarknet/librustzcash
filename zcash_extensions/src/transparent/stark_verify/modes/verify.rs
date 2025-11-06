@@ -232,8 +232,8 @@ pub fn verify_program(
     // Convert FieldElements to bytes for comparison
     let proof_initial_root: [u8; 32] = os_header.initial_root.to_bytes_be();
     let proof_final_root: [u8; 32] = os_header.final_root.to_bytes_be();
-    let proof_os_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be();
-    let proof_bootloader_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be();
+    let proof_os_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be();
+    let proof_bootloader_program_hash: [u8; 32] = verification_output.program_hash.to_bytes_be();
 
     // 5. Verify that input_initial_root == os_header.initial_root
     if input_initial_root != proof_initial_root {
