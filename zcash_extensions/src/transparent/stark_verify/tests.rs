@@ -55,10 +55,10 @@ fn extract_data_from_proof(proof_data: &[u8], _with_pedersen: bool, proof_format
     let final_root: [u8; 32] = os_header.final_root.to_bytes_be()
         .try_into()
         .map_err(|_| "Failed to convert final_root to bytes")?;
-    let os_program_hash: [u8; 32] = os_header.os_program_hash.to_bytes_be()
+    let os_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be()
         .try_into()
         .map_err(|_| "Failed to convert os_program_hash to bytes")?;
-    let bootloader_program_hash: [u8; 32] = bootloader_output.task_program_hash.to_bytes_be()
+    let bootloader_program_hash: [u8; 32] = verification_output.program_hash.to_bytes_be()
         .try_into()
         .map_err(|_| "Failed to convert bootloader_program_hash to bytes")?;
 
@@ -301,6 +301,11 @@ fn verify_proof_sepolia() {
         true,
         modes::verify::ProofFormat::BinEnc
     ).expect("Failed to extract data from proof");
+
+    println!("initial_root: {}", hex::encode(initial_root));
+    println!("final_root: {}", hex::encode(final_root));
+    println!("os_program_hash: {}", hex::encode(os_program_hash));
+    println!("bootloader_program_hash: {}", hex::encode(bootloader_program_hash));
 
     // Create a transaction with a STARK verification precondition output
     let out = TzeOut {

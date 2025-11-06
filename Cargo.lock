@@ -8421,6 +8421,7 @@ dependencies = [
  "bzip2",
  "cairo-air",
  "ff",
+ "hex",
  "itertools 0.12.1",
  "jubjub",
  "orchard",

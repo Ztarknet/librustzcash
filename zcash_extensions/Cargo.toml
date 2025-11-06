@@ -18,6 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 release = false
 
 [dependencies]
+hex.workspace = true
 blake2b_simd.workspace = true
 zcash_primitives = { version = "0.26", features = ["non-standard-fees", "circuits"] }
 zcash_protocol = { version = "0.7" }
